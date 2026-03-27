@@ -1,7 +1,6 @@
 import { useRouter } from "expo-router";
 import React, { useState } from "react";
 import {
-  Alert,
   KeyboardAvoidingView,
   Platform,
   StyleSheet,
@@ -15,40 +14,47 @@ import { supabase } from "../supabase";
 export default function LoginScreen() {
   const [login, setLogin] = useState("");
   const [pin, setPin] = useState("");
+  const [errorMsg, setErrorMsg] = useState(""); // STAN DLA BŁĘDÓW NA EKRANIE
   const router = useRouter();
 
   const handleLogin = async () => {
+    // Czyścimy błąd na start
+    setErrorMsg("");
+
     if (!login || !pin) {
-      Alert.alert("Błąd", "Proszę podać login i PIN.");
+      setErrorMsg("Proszę podać login i PIN.");
       return;
     }
 
     try {
       const { data, error } = await supabase.rpc("autoryzuj_pracownika", {
-        p_login: login.toLowerCase(),
-        p_pin: pin,
+        p_login: login.toLowerCase().trim(), // Zawsze małe litery, usuwamy spacje
+        p_pin: pin.trim(),
       });
 
       if (error) {
-        Alert.alert("Błąd serwera", error.message);
+        setErrorMsg("Błąd serwera: " + error.message);
       } else if (data && data.length > 0) {
         const user = data[0];
 
-        // BRAMKARZ: Segregacja po rolach wprost z Twojej bazy danych
+        // BRAMKARZ: Segregacja po rolach
         if (user.rola === "admin" || user.rola === "kierownik") {
-          // Szefostwo idzie do biura
           router.replace({
-            pathname: "/admin",
+            pathname: "/admin", // Zmień na swój plik panelu admina
             params: {
               idPracownika: user.id,
               nazwaPracownika: user.nazwa_wyswietlana,
             },
           });
         } else if (user.rola === "dyrektor") {
-          // NOWE: Dyrektor ma swój własny Hub
-          router.replace("/panel-dyrektor");
+          router.replace({
+            pathname: "/panel-dyrektor",
+            params: {
+              idPracownika: user.id,
+              nazwaPracownika: user.nazwa_wyswietlana,
+            },
+          });
         } else if (user.rola === "szef") {
-          // NOWE: Przekierowanie do dedykowanego Panelu Szefa
           router.replace({
             pathname: "/panel-szef",
             params: {
@@ -57,7 +63,6 @@ export default function LoginScreen() {
             },
           });
         } else if (user.rola === "kierownik_produkcji") {
-          // NOWE: Przekierowanie do dedykowanego Panelu Szefa
           router.replace({
             pathname: "/kierownik-panel",
             params: {
@@ -66,7 +71,6 @@ export default function LoginScreen() {
             },
           });
         } else if (user.rola === "biuro") {
-          // NOWE: Pracownicy biurowi idą do dedykowanego Panelu Biurowego
           router.replace({
             pathname: "/panel-biuro",
             params: {
@@ -75,7 +79,6 @@ export default function LoginScreen() {
             },
           });
         } else if (user.rola === "ubieralnia") {
-          // Pracownicy Ubieralni idą do swojego panelu montażu
           router.replace({
             pathname: "/hala-ubieralnia",
             params: {
@@ -100,7 +103,6 @@ export default function LoginScreen() {
             },
           });
         } else if (user.rola === "krojcza_kierownik_szwalni") {
-          // Krojcza idzie do Krojowni (pierwszy etap)
           router.replace({
             pathname: "/hala-krojownia",
             params: {
@@ -109,7 +111,7 @@ export default function LoginScreen() {
             },
           });
         } else {
-          // Krawcowe / Szwaczki idą do Szwalni (drugi etap - stworzymy ten ekran za chwilę)
+          // Krawcowe / Szwaczki itp. idą na szwalnię
           router.replace({
             pathname: "/hala-szwalnia",
             params: {
@@ -119,12 +121,14 @@ export default function LoginScreen() {
           });
         }
       } else {
-        Alert.alert("Odmowa dostępu", "Nieprawidłowy login lub PIN.");
+        // ZWRACA PUSTE DANE = BŁĘDNY LOGIN LUB HASŁO
+        setErrorMsg("Nieprawidłowy login lub PIN.");
       }
     } catch (err) {
-      Alert.alert("Błąd", "Problem z połączeniem z bazą danych.");
+      setErrorMsg("Problem z połączeniem z bazą danych.");
     }
   };
+
   return (
     <KeyboardAvoidingView
       style={styles.container}
@@ -138,14 +142,18 @@ export default function LoginScreen() {
         </View>
 
         <View style={styles.inputGroup}>
-          <Text style={styles.label}>ID Pracownika</Text>
+          <Text style={styles.label}>ID Pracownika / Login</Text>
           <TextInput
             style={styles.input}
             placeholder="np. krawcowa01"
             placeholderTextColor="#9ca3af"
             value={login}
-            onChangeText={setLogin}
+            onChangeText={(text) => {
+              setLogin(text);
+              setErrorMsg(""); // Czyści błąd jak zaczniesz pisać
+            }}
             autoCapitalize="none"
+            onSubmitEditing={handleLogin}
           />
         </View>
 
@@ -158,9 +166,20 @@ export default function LoginScreen() {
             secureTextEntry={true}
             keyboardType="numeric"
             value={pin}
-            onChangeText={setPin}
+            onChangeText={(text) => {
+              setPin(text);
+              setErrorMsg(""); // Czyści błąd jak zaczniesz pisać
+            }}
+            onSubmitEditing={handleLogin}
           />
         </View>
+
+        {/* POJEMNIK NA BŁĘDY - WIDOCZNY TYLKO JAK JEST BŁĄD */}
+        {errorMsg ? (
+          <View style={styles.errorContainer}>
+            <Text style={styles.errorText}>⚠️ {errorMsg}</Text>
+          </View>
+        ) : null}
 
         <TouchableOpacity
           style={styles.button}
@@ -205,7 +224,7 @@ const styles = StyleSheet.create({
     shadowRadius: 20,
     elevation: 10,
   },
-  header: { alignItems: "center", marginBottom: 40 },
+  header: { alignItems: "center", marginBottom: 30 },
   logoText: {
     fontSize: 32,
     fontWeight: "900",
@@ -238,12 +257,29 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: "#0f172a",
   },
+
+  // NOWE STYLE DLA BŁĘDÓW
+  errorContainer: {
+    backgroundColor: "#fef2f2",
+    borderWidth: 1,
+    borderColor: "#f87171",
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 20,
+    alignItems: "center",
+  },
+  errorText: {
+    color: "#ef4444",
+    fontSize: 14,
+    fontWeight: "bold",
+  },
+
   button: {
     backgroundColor: "#0ea5e9",
     borderRadius: 12,
     padding: 18,
     alignItems: "center",
-    marginTop: 10,
+    marginTop: 5,
     shadowColor: "#0ea5e9",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.3,
