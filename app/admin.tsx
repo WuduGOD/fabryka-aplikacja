@@ -11,7 +11,7 @@ import CzatWidget from "../components/CzatWidget";
 
 export default function AdminHubScreen() {
   const router = useRouter();
-  const { idPracownika, nazwaPracownika } = useLocalSearchParams();
+  const { idPracownika, nazwaPracownika, rola } = useLocalSearchParams();
 
   return (
     <View style={styles.container}>
@@ -77,10 +77,25 @@ export default function AdminHubScreen() {
 
       <View style={styles.footer}>
         <TouchableOpacity
+          style={[
+            styles.logoutButton,
+            { backgroundColor: "#3b82f6", marginBottom: 10 },
+          ]}
+          onPress={() =>
+            router.push({
+              pathname: "/wybor-dzialu",
+              params: { idPracownika, nazwaPracownika, rola },
+            })
+          }
+        >
+          <Text style={styles.buttonText}>🔄 ZMIEŃ DZIAŁ (ZASTĘPSTWO)</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
           style={styles.logoutButton}
           onPress={() => router.replace("/")}
         >
-          <Text style={styles.buttonText}>WYLOGUJ SIĘ</Text>
+          <Text style={styles.buttonText}>ZAKOŃCZ ZMIANĘ (WYLOGUJ)</Text>
         </TouchableOpacity>
       </View>
       <CzatWidget

@@ -1,25 +1,28 @@
 import { CameraView, useCameraPermissions } from "expo-camera";
+import * as Network from "expo-network";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import React, { useEffect, useRef, useState } from "react";
 import {
-    Alert,
-    Keyboard,
-    KeyboardAvoidingView,
-    Modal,
-    Platform,
-    RefreshControl,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View
+  Alert,
+  Keyboard,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  RefreshControl,
+  SafeAreaView,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from "react-native";
+import { SyncManager } from "../components/SyncManager";
 import { supabase } from "../supabase";
 
 export default function MagazynWysylkaScreen() {
   const router = useRouter();
-  const { idPracownika, nazwaPracownika } = useLocalSearchParams();
+  const { idPracownika, nazwaPracownika, rola } = useLocalSearchParams();
 
   const [kodZlecenia, setKodZlecenia] = useState("");
   const [permission, requestPermission] = useCameraPermissions();
@@ -30,6 +33,10 @@ export default function MagazynWysylkaScreen() {
   const [pozycje, setPozycje] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  // --- STANY OFFLINE ---
+  const [isOnline, setIsOnline] = useState(true);
+  const [zalegleSkany, setZalegleSkany] = useState(0);
 
   // Modal do wyboru sposobu wysyłki
   const [isWysylkaModalVisible, setIsWysylkaModalVisible] = useState(false);
@@ -68,6 +75,14 @@ export default function MagazynWysylkaScreen() {
 
   useEffect(() => {
     fetchZlecenia();
+
+    // --- CZUJNIK OFFLINE ---
+    const netInterval = setInterval(async () => {
+      const netInfo = await Network.getNetworkStateAsync();
+      setIsOnline(!!(netInfo.isConnected && netInfo.isInternetReachable));
+      setZalegleSkany(await SyncManager.pobierzIloscWklejce());
+    }, 3000);
+
     const subskrypcja = supabase
       .channel("zmiany_magazyn")
       .on(
@@ -76,7 +91,9 @@ export default function MagazynWysylkaScreen() {
         () => fetchZlecenia(true),
       )
       .subscribe();
+
     return () => {
+      clearInterval(netInterval);
       supabase.removeChannel(subskrypcja);
     };
   }, []);
@@ -94,6 +111,7 @@ export default function MagazynWysylkaScreen() {
       const czesci = kodRaw.split("^");
       const numerZD = czesci[0].trim();
 
+      // Szukanie LOKALNIE
       const znalezioneZlecenie = zleceniaDoWysylki.find(
         (z) => z.numer_zd === numerZD,
       );
@@ -101,18 +119,25 @@ export default function MagazynWysylkaScreen() {
       if (znalezioneZlecenie) {
         setExpandedId(znalezioneZlecenie.id);
       } else {
-        // Sprawdzamy w bazie, czy przypadkiem nie ma innego statusu
-        const { data: zlecenie } = await supabase
-          .from("zlecenia")
-          .select("*")
-          .eq("numer_zd", numerZD)
-          .single();
-        if (!zlecenie) {
-          Alert.alert("Błąd", `Nie znaleziono ZD: ${numerZD}`);
+        if (isOnline) {
+          // Jeśli jest internet, upewnijmy się jaki to ma status w bazie
+          const { data: zlecenie } = await supabase
+            .from("zlecenia")
+            .select("*")
+            .eq("numer_zd", numerZD)
+            .single();
+          if (!zlecenie) {
+            Alert.alert("Błąd", `Nie znaleziono ZD: ${numerZD}`);
+          } else {
+            Alert.alert(
+              "Informacja",
+              `To ZD ma status: ${zlecenie.status}. Nie jest jeszcze na wysyłce!`,
+            );
+          }
         } else {
           Alert.alert(
-            "Informacja",
-            `To ZD ma status: ${zlecenie.status}. Nie jest jeszcze na wysyłce!`,
+            "Tryb Offline",
+            `Zlecenie ${numerZD} nie znajduje się na liście "Do wysyłki". Włącz internet, by sprawdzić bazę.`,
           );
         }
       }
@@ -121,7 +146,7 @@ export default function MagazynWysylkaScreen() {
       setIsCameraOpen(false);
       Keyboard.dismiss();
     } catch (err) {
-      Alert.alert("Błąd bazy.");
+      Alert.alert("Błąd aplikacji.");
     } finally {
       setLoading(false);
       setTimeout(() => {
@@ -141,33 +166,63 @@ export default function MagazynWysylkaScreen() {
     setIsWysylkaModalVisible(false);
 
     try {
-      // Ostateczne zamknięcie zlecenia!
-      await supabase
-        .from("zlecenia")
-        .update({
-          status: "zrealizowane",
-          sposob_wysylki: sposob,
-        })
-        .eq("id", zlecenieDoWysylki.id);
+      if (isOnline) {
+        // ONLINE: Ostateczne zamknięcie zlecenia!
+        await supabase
+          .from("zlecenia")
+          .update({
+            status: "zrealizowane",
+            sposob_wysylki: sposob,
+          })
+          .eq("id", zlecenieDoWysylki.id);
 
-      await supabase.from("historia_statusow").insert([
-        {
+        await supabase.from("historia_statusow").insert([
+          {
+            id_zlecenia: zlecenieDoWysylki.id,
+            id_pracownika: idPracownika,
+            id_firmy: zlecenieDoWysylki.id_firmy,
+            stary_status: "do_wysylki",
+            nowy_status: "zrealizowane",
+          },
+        ]);
+
+        if (Platform.OS === "web") {
+          window.alert(
+            `✅ ZD ${zlecenieDoWysylki.numer_zd} wysłane jako: ${sposob}`,
+          );
+        } else {
+          Alert.alert("Sukces!", `Wysłano jako: ${sposob}`);
+        }
+      } else {
+        // OFFLINE: Przechwytywane przez Kuriera
+        await SyncManager.dodajDoKolejki(
+          "zlecenia",
+          "UPDATE",
+          { status: "zrealizowane", sposob_wysylki: sposob },
+          zlecenieDoWysylki.id,
+        );
+        await SyncManager.dodajDoKolejki("historia_statusow", "INSERT", {
           id_zlecenia: zlecenieDoWysylki.id,
           id_pracownika: idPracownika,
           id_firmy: zlecenieDoWysylki.id_firmy,
           stary_status: "do_wysylki",
           nowy_status: "zrealizowane",
-        },
-      ]);
+        });
 
-      if (Platform.OS === "web")
-        window.alert(
-          `✅ ZD ${zlecenieDoWysylki.numer_zd} wysłane jako: ${sposob}`,
+        if (Platform.OS === "web") {
+          window.alert(`✅ Zapisano offline: ${sposob}`);
+        } else {
+          Alert.alert("Tryb Offline", `Zapisano jako: ${sposob}`);
+        }
+
+        // Optymistycznie usuwamy z ekranu
+        setZleceniaDoWysylki((prev) =>
+          prev.filter((z) => z.id !== zlecenieDoWysylki.id),
         );
-      else Alert.alert("Sukces!", `Wysłano jako: ${sposob}`);
+      }
 
       setExpandedId(null);
-      fetchZlecenia(true);
+      if (isOnline) fetchZlecenia(true);
     } catch (e) {
       Alert.alert("Błąd przy zapisie wysyłki.");
     } finally {
@@ -251,7 +306,22 @@ export default function MagazynWysylkaScreen() {
 
   if (isCameraOpen) {
     return (
-      <View style={{ flex: 1, backgroundColor: "#000" }}>
+      <SafeAreaView style={{ flex: 1, backgroundColor: "#000" }}>
+        {!isOnline && (
+          <View
+            style={{
+              width: "100%",
+              backgroundColor: "#ef4444",
+              paddingVertical: 10,
+              alignItems: "center",
+              zIndex: 1000,
+            }}
+          >
+            <Text style={{ color: "white", fontWeight: "bold" }}>
+              ⚠️ BRAK INTERNETU - Tryb Offline
+            </Text>
+          </View>
+        )}
         <CameraView
           style={StyleSheet.absoluteFillObject}
           facing="back"
@@ -270,150 +340,189 @@ export default function MagazynWysylkaScreen() {
         >
           <Text style={styles.buttonText}>ANULUJ I WRÓĆ</Text>
         </TouchableOpacity>
-      </View>
+      </SafeAreaView>
     );
   }
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === "ios" ? "padding" : "height"}
-    >
-      {/* MODAL WYBORU WYSYŁKI */}
-      <Modal
-        visible={isWysylkaModalVisible}
-        transparent={true}
-        animationType="slide"
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>
-              Jak wysyłasz {zlecenieDoWysylki?.numer_zd}?
+    <SafeAreaView style={{ flex: 1, backgroundColor: "#faf5ff" }}>
+      {/* Pasek Offline na samej górze */}
+      {!isOnline && (
+        <View
+          style={{
+            width: "100%",
+            backgroundColor: "#ef4444",
+            paddingVertical: 10,
+            alignItems: "center",
+            zIndex: 1000,
+          }}
+        >
+          <Text style={{ color: "white", fontWeight: "bold" }}>
+            ⚠️ BRAK INTERNETU - Tryb Offline
+          </Text>
+          {zalegleSkany > 0 && (
+            <Text style={{ color: "white", fontSize: 12 }}>
+              Oczekujące wysyłki w schowku: {zalegleSkany}
             </Text>
-
-            <TouchableOpacity
-              style={[
-                styles.modalOptionBtn,
-                {
-                  backgroundColor: "#e0f2fe",
-                  borderColor: "#38bdf8",
-                  borderWidth: 2,
-                },
-              ]}
-              onPress={() => finalizujWysylke("KURIER / PACZKA")}
-            >
-              <Text style={[styles.modalOptionText, { color: "#0369a1" }]}>
-                📦 KURIER / PACZKA (Detal)
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[
-                styles.modalOptionBtn,
-                {
-                  backgroundColor: "#fef3c7",
-                  borderColor: "#fbbf24",
-                  borderWidth: 2,
-                },
-              ]}
-              onPress={() => finalizujWysylke("PALETA")}
-            >
-              <Text style={[styles.modalOptionText, { color: "#b45309" }]}>
-                🪵 PALETA (Hurt/Zagranica)
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[
-                styles.modalOptionBtn,
-                {
-                  backgroundColor: "#f3f4f6",
-                  borderColor: "#9ca3af",
-                  borderWidth: 2,
-                },
-              ]}
-              onPress={() => finalizujWysylke("TIR / LUZEM")}
-            >
-              <Text style={[styles.modalOptionText, { color: "#374151" }]}>
-                🚛 TIR / LUZEM (Duży hurt)
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.modalCancelBtn}
-              onPress={() => setIsWysylkaModalVisible(false)}
-            >
-              <Text style={styles.modalCancelText}>ANULUJ</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
-
-      <View style={styles.header}>
-        <Text style={styles.title}>Panel Wysyłki (Magazyn)</Text>
-        <Text style={styles.subtitle}>Pracownik: {nazwaPracownika}</Text>
-      </View>
-
-      <View style={styles.listWrapper}>
-        <ScrollView
-          showsVerticalScrollIndicator={false}
-          contentContainerStyle={{ paddingBottom: 20, alignItems: "center" }}
-          refreshControl={
-            <RefreshControl
-              refreshing={loading}
-              onRefresh={() => fetchZlecenia(false)}
-              colors={["#8b5cf6"]}
-            />
-          }
-        >
-          <View style={styles.card}>
-            <Text style={styles.label}>ZESKANUJ ZD DO SPAKOWANIA:</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Zeskanuj kod lub wpisz numer..."
-              value={kodZlecenia}
-              onChangeText={setKodZlecenia}
-              onSubmitEditing={() => handleSkanujZlecenie()}
-            />
-            <TouchableOpacity
-              style={styles.cameraButton}
-              onPress={async () => {
-                if (!permission?.granted) {
-                  const { granted } = await requestPermission();
-                  if (!granted) return;
-                }
-                setIsCameraOpen(true);
-              }}
-            >
-              <Text style={styles.cameraButtonText}>
-                📸 WŁĄCZ SKANER (APARAT)
-              </Text>
-            </TouchableOpacity>
-          </View>
-
-          {!loading && (
-            <View style={{ width: "100%", maxWidth: 500 }}>
-              <Text style={[styles.sectionHeader, { marginTop: 10 }]}>
-                📋 DO SPAKOWANIA I WYSŁANIA ({zleceniaDoWysylki.length}):
-              </Text>
-              {zleceniaDoWysylki.length === 0 && (
-                <Text style={styles.emptyText}>Brak wózków do wysyłki.</Text>
-              )}
-              {zleceniaDoWysylki.map((z) => renderZlecenie(z))}
-            </View>
           )}
-        </ScrollView>
-      </View>
+        </View>
+      )}
 
-      <View style={styles.footerContainer}>
-        <TouchableOpacity
-          style={styles.logoutButton}
-          onPress={() => router.replace("/")}
+      <KeyboardAvoidingView
+        style={[styles.container, !isOnline && { paddingTop: 10 }]} // Mniejszy odstęp jak jest pasek błędu
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+      >
+        {/* MODAL WYBORU WYSYŁKI */}
+        <Modal
+          visible={isWysylkaModalVisible}
+          transparent={true}
+          animationType="slide"
         >
-          <Text style={styles.buttonText}>ZAKOŃCZ ZMIANĘ (WYLOGUJ)</Text>
-        </TouchableOpacity>
-      </View>
-    </KeyboardAvoidingView>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>
+                Jak wysyłasz {zlecenieDoWysylki?.numer_zd}?
+              </Text>
+
+              <TouchableOpacity
+                style={[
+                  styles.modalOptionBtn,
+                  {
+                    backgroundColor: "#e0f2fe",
+                    borderColor: "#38bdf8",
+                    borderWidth: 2,
+                  },
+                ]}
+                onPress={() => finalizujWysylke("KURIER / PACZKA")}
+              >
+                <Text style={[styles.modalOptionText, { color: "#0369a1" }]}>
+                  📦 KURIER / PACZKA (Detal)
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.modalOptionBtn,
+                  {
+                    backgroundColor: "#fef3c7",
+                    borderColor: "#fbbf24",
+                    borderWidth: 2,
+                  },
+                ]}
+                onPress={() => finalizujWysylke("PALETA")}
+              >
+                <Text style={[styles.modalOptionText, { color: "#b45309" }]}>
+                  🪵 PALETA (Hurt/Zagranica)
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.modalOptionBtn,
+                  {
+                    backgroundColor: "#f3f4f6",
+                    borderColor: "#9ca3af",
+                    borderWidth: 2,
+                  },
+                ]}
+                onPress={() => finalizujWysylke("TIR / LUZEM")}
+              >
+                <Text style={[styles.modalOptionText, { color: "#374151" }]}>
+                  🚛 TIR / LUZEM (Duży hurt)
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.modalCancelBtn}
+                onPress={() => setIsWysylkaModalVisible(false)}
+              >
+                <Text style={styles.modalCancelText}>ANULUJ</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
+        <View style={styles.header}>
+          <Text style={styles.title}>Panel Wysyłki (Magazyn)</Text>
+          <Text style={styles.subtitle}>Pracownik: {nazwaPracownika}</Text>
+        </View>
+
+        <View style={styles.listWrapper}>
+          <ScrollView
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={{ paddingBottom: 20, alignItems: "center" }}
+            refreshControl={
+              <RefreshControl
+                refreshing={loading}
+                onRefresh={() => fetchZlecenia(false)}
+                colors={["#8b5cf6"]}
+              />
+            }
+          >
+            <View style={styles.card}>
+              <Text style={styles.label}>ZESKANUJ ZD DO SPAKOWANIA:</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Zeskanuj kod lub wpisz numer..."
+                value={kodZlecenia}
+                onChangeText={setKodZlecenia}
+                onSubmitEditing={() => handleSkanujZlecenie()}
+              />
+              <TouchableOpacity
+                style={styles.cameraButton}
+                onPress={async () => {
+                  if (!permission?.granted) {
+                    const { granted } = await requestPermission();
+                    if (!granted) return;
+                  }
+                  setIsCameraOpen(true);
+                }}
+              >
+                <Text style={styles.cameraButtonText}>
+                  📸 WŁĄCZ SKANER (APARAT)
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {!loading && (
+              <View style={{ width: "100%", maxWidth: 500 }}>
+                <Text style={[styles.sectionHeader, { marginTop: 10 }]}>
+                  📋 DO SPAKOWANIA I WYSŁANIA ({zleceniaDoWysylki.length}):
+                </Text>
+                {zleceniaDoWysylki.length === 0 && (
+                  <Text style={styles.emptyText}>Brak wózków do wysyłki.</Text>
+                )}
+                {zleceniaDoWysylki.map((z) => renderZlecenie(z))}
+              </View>
+            )}
+          </ScrollView>
+        </View>
+
+        <View style={styles.footerContainer}>
+          <TouchableOpacity
+            style={[
+              styles.logoutButton,
+              { backgroundColor: "#3b82f6", marginBottom: 10 },
+            ]}
+            onPress={() =>
+              router.push({
+                pathname: "/wybor-dzialu",
+                params: { idPracownika, nazwaPracownika, rola },
+              })
+            }
+          >
+            <Text style={styles.buttonText}>🔄 ZMIEŃ DZIAŁ (ZASTĘPSTWO)</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.logoutButton}
+            onPress={() => router.replace("/")}
+          >
+            <Text style={styles.buttonText}>ZAKOŃCZ ZMIANĘ (WYLOGUJ)</Text>
+          </TouchableOpacity>
+        </View>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 
@@ -507,7 +616,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#fef2f2",
     borderColor: "#fca5a5",
     borderWidth: 2,
-  }, // Wyróżnienie czerwonym dla rzeczy z regału!
+  },
   pozycjaTopRow: {
     flexDirection: "row",
     justifyContent: "space-between",

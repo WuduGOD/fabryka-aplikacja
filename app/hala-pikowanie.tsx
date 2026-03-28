@@ -1,4 +1,5 @@
 import { CameraView, useCameraPermissions } from "expo-camera";
+import * as Network from "expo-network";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import React, { useEffect, useRef, useState } from "react";
 import {
@@ -9,6 +10,7 @@ import {
   Modal,
   Platform,
   RefreshControl,
+  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
@@ -16,11 +18,13 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import CzatWidget from "../components/CzatWidget";
+import { SyncManager } from "../components/SyncManager";
 import { supabase } from "../supabase";
 
 export default function PikowanieScreen() {
   const router = useRouter();
-  const { idPracownika, nazwaPracownika } = useLocalSearchParams();
+  const { idPracownika, nazwaPracownika, rola } = useLocalSearchParams();
 
   const [kodZlecenia, setKodZlecenia] = useState("");
   const [permission, requestPermission] = useCameraPermissions();
@@ -35,6 +39,10 @@ export default function PikowanieScreen() {
   const [wszystkieLogiPracownika, setWszystkieLogiPracownika] = useState<any[]>([]);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // --- STANY OFFLINE ---
+  const [isOnline, setIsOnline] = useState(true);
+  const [zalegleSkany, setZalegleSkany] = useState(0);
 
   const [isPauseModalVisible, setIsPauseModalVisible] = useState(false);
   const [zlecenieDoPauzy, setZlecenieDoPauzy] = useState<any>(null);
@@ -84,7 +92,7 @@ export default function PikowanieScreen() {
             .from("pozycje_zlecenia")
             .select("*")
             .in("id_zlecenia", zleceniaIds)
-            .eq("czy_z_regalu", false); // Pikowacz widzi tylko to co wyprodukowane
+            .eq("czy_z_regalu", false); 
           if (pozycjeData) setPozycje(pozycjeData);
         } else {
           setPozycje([]);
@@ -99,14 +107,25 @@ export default function PikowanieScreen() {
 
   useEffect(() => {
     fetchZlecenia();
+
+    // --- CZUJNIK OFFLINE ---
+    const netInterval = setInterval(async () => {
+      const netInfo = await Network.getNetworkStateAsync();
+      setIsOnline(!!(netInfo.isConnected && netInfo.isInternetReachable));
+      setZalegleSkany(await SyncManager.pobierzIloscWklejce());
+    }, 3000);
+
     const subskrypcja = supabase
       .channel("zmiany_pikowanie")
       .on("postgres_changes", { event: "*", schema: "public", table: "zlecenia" }, () => fetchZlecenia(true))
       .subscribe();
-    return () => { supabase.removeChannel(subskrypcja); };
+
+    return () => { 
+      clearInterval(netInterval);
+      supabase.removeChannel(subskrypcja); 
+    };
   }, []);
 
-  // --- FILTR UWAG DLA PIKOWANIA ---
   const filtrujUwagiPikowania = (instrukcje: string) => {
     if (!instrukcje) return "";
     const indexPikowanie = instrukcje.toUpperCase().indexOf("PIKOWANIE");
@@ -115,7 +134,6 @@ export default function PikowanieScreen() {
       if (tekstPo.startsWith(":")) tekstPo = tekstPo.substring(1).trim();
       return tekstPo;
     }
-    // Ukrywamy uwagi ewidentnie kierowane do innych działów
     if (instrukcje.toUpperCase().includes("SZWALNIA") || instrukcje.toUpperCase().includes("PRODUKCJA")) {
       return ""; 
     }
@@ -124,6 +142,8 @@ export default function PikowanieScreen() {
 
   const handleStartPozycji = async (zlecenieId: string, pozycjaId: string, idFirmy: string) => {
     const tymczasowyLogId = "temp-" + Date.now();
+    
+    // Optymistyczna zmiana UI
     setWszystkieLogiPracownika((prev) => {
       const zamknieteStare = prev.map((l) => l.czas_stop === null ? { ...l, czas_stop: new Date().toISOString() } : l);
       return [{ id: tymczasowyLogId, id_zlecenia: zlecenieId, id_pozycji: pozycjaId, czas_stop: null }, ...zamknieteStare];
@@ -132,19 +152,27 @@ export default function PikowanieScreen() {
     const aktywnyLog = wszystkieLogiPracownika.find((l) => l.czas_stop === null);
     if (aktywnyLog && aktywnyLog.id_pozycji === pozycjaId) return;
 
-    await supabase
-      .from("logi_pracy")
-      .update({ czas_stop: new Date().toISOString() })
-      .eq("id_pracownika", idPracownika)
-      .eq("etap_pracy", "pikowanie")
-      .is("czas_stop", null);
+    if (isOnline) {
+      await supabase
+        .from("logi_pracy")
+        .update({ czas_stop: new Date().toISOString() })
+        .match({ id_pracownika: idPracownika, etap_pracy: "pikowanie" })
+        .is("czas_stop", null);
 
-    const { error } = await supabase.from("logi_pracy").insert([
-      { id_zlecenia: zlecenieId, id_pracownika: idPracownika, id_firmy: idFirmy, etap_pracy: "pikowanie", id_pozycji: pozycjaId },
-    ]);
-
-    if (error) Alert.alert("Błąd zapisu", error.message);
-    fetchZlecenia(true);
+      const { error } = await supabase.from("logi_pracy").insert([
+        { id_zlecenia: zlecenieId, id_pracownika: idPracownika, id_firmy: idFirmy, etap_pracy: "pikowanie", id_pozycji: pozycjaId },
+      ]);
+      if (error) Alert.alert("Błąd zapisu", error.message);
+      fetchZlecenia(true);
+    } else {
+      await SyncManager.dodajDoKolejki("logi_pracy", "UPDATE", 
+        { czas_stop: new Date().toISOString() }, 
+        { id_pracownika: idPracownika, etap_pracy: "pikowanie", czas_stop: null }
+      );
+      await SyncManager.dodajDoKolejki("logi_pracy", "INSERT", 
+        { id_zlecenia: zlecenieId, id_pracownika: idPracownika, id_firmy: idFirmy, etap_pracy: "pikowanie", id_pozycji: pozycjaId }
+      );
+    }
   };
 
   const handleZatwierdzPauze = async (powod: string) => {
@@ -157,14 +185,19 @@ export default function PikowanieScreen() {
       )
     );
 
-    await supabase
-      .from("logi_pracy")
-      .update({ czas_stop: new Date().toISOString(), uwagi: `PAUZA: ${powod}` })
-      .eq("id_pracownika", idPracownika)
-      .eq("etap_pracy", "pikowanie")
-      .is("czas_stop", null);
-
-    fetchZlecenia(true);
+    if (isOnline) {
+      await supabase
+        .from("logi_pracy")
+        .update({ czas_stop: new Date().toISOString(), uwagi: `PAUZA: ${powod}` })
+        .match({ id_pracownika: idPracownika, etap_pracy: "pikowanie" })
+        .is("czas_stop", null);
+      fetchZlecenia(true);
+    } else {
+      await SyncManager.dodajDoKolejki("logi_pracy", "UPDATE", 
+        { czas_stop: new Date().toISOString(), uwagi: `PAUZA: ${powod}` }, 
+        { id_pracownika: idPracownika, etap_pracy: "pikowanie", czas_stop: null }
+      );
+    }
     setZlecenieDoPauzy(null);
   };
 
@@ -174,36 +207,54 @@ export default function PikowanieScreen() {
 
     setWszystkieLogiPracownika((prev) => [{ id: "temp-" + Date.now(), id_zlecenia: zlecenieId, id_pozycji: pozycjaId, czas_stop: null }, ...prev]);
 
-    const { error } = await supabase.from("logi_pracy").insert([
-      { id_zlecenia: zlecenieId, id_pracownika: idPracownika, id_firmy: idFirmy, etap_pracy: "pikowanie", id_pozycji: pozycjaId },
-    ]);
-    if (error) Alert.alert("Błąd", error.message);
-    fetchZlecenia(true);
+    if (isOnline) {
+      const { error } = await supabase.from("logi_pracy").insert([
+        { id_zlecenia: zlecenieId, id_pracownika: idPracownika, id_firmy: idFirmy, etap_pracy: "pikowanie", id_pozycji: pozycjaId },
+      ]);
+      if (error) Alert.alert("Błąd", error.message);
+      fetchZlecenia(true);
+    } else {
+      await SyncManager.dodajDoKolejki("logi_pracy", "INSERT", 
+        { id_zlecenia: zlecenieId, id_pracownika: idPracownika, id_firmy: idFirmy, etap_pracy: "pikowanie", id_pozycji: pozycjaId }
+      );
+    }
   };
 
   const handleZakonczWozekRaw = async (zlecenie: any) => {
     const wykonajZakonczenie = async () => {
       setLoading(true);
       try {
-        await supabase
-          .from("logi_pracy")
-          .update({ czas_stop: new Date().toISOString() })
-          .eq("id_pracownika", idPracownika)
-          .eq("etap_pracy", "pikowanie")
-          .is("czas_stop", null);
+        if (isOnline) {
+          await supabase
+            .from("logi_pracy")
+            .update({ czas_stop: new Date().toISOString() })
+            .match({ id_pracownika: idPracownika, etap_pracy: "pikowanie" })
+            .is("czas_stop", null);
 
-        // ZMIANA: Wysyłamy do WYSYŁKI! Ostatni etap produkcji.
-        await supabase.from("zlecenia").update({ status: "do_wysylki" }).eq("id", zlecenie.id);
-        await supabase.from("historia_statusow").insert([
-          { id_zlecenia: zlecenie.id, id_pracownika: idPracownika, id_firmy: zlecenie.id_firmy, stary_status: "pikowanie_w_trakcie", nowy_status: "do_wysylki" },
-        ]);
+          await supabase.from("zlecenia").update({ status: "do_wysylki" }).eq("id", zlecenie.id);
+          await supabase.from("historia_statusow").insert([
+            { id_zlecenia: zlecenie.id, id_pracownika: idPracownika, id_firmy: zlecenie.id_firmy, stary_status: "pikowanie_w_trakcie", nowy_status: "do_wysylki" },
+          ]);
 
-        if (Platform.OS === "web") window.alert(`Koniec produkcji! ZD ${zlecenie.numer_zd} jedzie na Wysyłkę.`);
-        else Alert.alert("Gotowe!", `Wózek jedzie do magazynu/wysyłki!`);
+          if (Platform.OS === "web") window.alert(`Koniec produkcji! ZD ${zlecenie.numer_zd} jedzie na Wysyłkę.`);
+          else Alert.alert("Gotowe!", `Wózek jedzie do magazynu/wysyłki!`);
+        } else {
+          await SyncManager.dodajDoKolejki("logi_pracy", "UPDATE", 
+            { czas_stop: new Date().toISOString() }, 
+            { id_pracownika: idPracownika, etap_pracy: "pikowanie", czas_stop: null }
+          );
+          await SyncManager.dodajDoKolejki("zlecenia", "UPDATE", { status: "do_wysylki" }, zlecenie.id);
+          await SyncManager.dodajDoKolejki("historia_statusow", "INSERT", { id_zlecenia: zlecenie.id, id_pracownika: idPracownika, id_firmy: zlecenie.id_firmy, stary_status: "pikowanie_w_trakcie", nowy_status: "do_wysylki" });
+
+          if (Platform.OS === "web") window.alert(`Koniec produkcji (Offline)! Zapisano w kolejce.`);
+          else Alert.alert("Gotowe (Offline)!", `Zapisano w kolejce.`);
+
+          setZleceniaWTrakcie((prev) => prev.filter(z => z.id !== zlecenie.id));
+        }
 
         setExpandedId(null);
         setLoading(false);
-        fetchZlecenia(true);
+        if (isOnline) fetchZlecenia(true);
       } catch (e) {
         Alert.alert("Błąd zapisu.");
         setLoading(false);
@@ -231,17 +282,33 @@ export default function PikowanieScreen() {
       setLoading(true);
       const czesci = kodRaw.split("^");
       const numerZD = czesci[0].trim();
-      const { data: zlecenie } = await supabase.from("zlecenia").select("*").eq("numer_zd", numerZD).single();
       
-      if (!zlecenie) { Alert.alert("Błąd", `Nie znaleziono ZD: ${numerZD}`); return; }
+      // ZMIANA OFFLINE: Szukamy lokalnie zamiast pytać bazę
+      const wszystkieLokalne = [...zleceniaGotowe, ...zleceniaWTrakcie, ...zleceniaZapauzowane];
+      const zlecenie = wszystkieLokalne.find(z => z.numer_zd === numerZD);
+      
+      if (!zlecenie) { 
+        Alert.alert("Błąd", `Nie znaleziono ZD na liście: ${numerZD}`); 
+        setLoading(false);
+        isProcessing.current = false;
+        return; 
+      }
 
       const aktualnyStatus = zlecenie.status;
 
       if (aktualnyStatus === "oczekuje_pikowanie") {
-        await supabase.from("zlecenia").update({ status: "pikowanie_w_trakcie" }).eq("id", zlecenie.id);
-        await supabase.from("historia_statusow").insert([
-          { id_zlecenia: zlecenie.id, id_pracownika: idPracownika, id_firmy: zlecenie.id_firmy, stary_status: aktualnyStatus, nowy_status: "pikowanie_w_trakcie" },
-        ]);
+        if (isOnline) {
+          await supabase.from("zlecenia").update({ status: "pikowanie_w_trakcie" }).eq("id", zlecenie.id);
+          await supabase.from("historia_statusow").insert([
+            { id_zlecenia: zlecenie.id, id_pracownika: idPracownika, id_firmy: zlecenie.id_firmy, stary_status: aktualnyStatus, nowy_status: "pikowanie_w_trakcie" },
+          ]);
+        } else {
+          await SyncManager.dodajDoKolejki("zlecenia", "UPDATE", { status: "pikowanie_w_trakcie" }, zlecenie.id);
+          await SyncManager.dodajDoKolejki("historia_statusow", "INSERT", { id_zlecenia: zlecenie.id, id_pracownika: idPracownika, id_firmy: zlecenie.id_firmy, stary_status: aktualnyStatus, nowy_status: "pikowanie_w_trakcie" });
+          
+          setZleceniaGotowe(prev => prev.filter(z => z.id !== zlecenie.id));
+          setZleceniaWTrakcie(prev => [...prev, { ...zlecenie, status: "pikowanie_w_trakcie" }]);
+        }
         setExpandedId(zlecenie.id);
       } else if (aktualnyStatus === "pikowanie_w_trakcie") {
         setExpandedId(zlecenie.id);
@@ -252,9 +319,9 @@ export default function PikowanieScreen() {
       setKodZlecenia("");
       setIsCameraOpen(false);
       Keyboard.dismiss();
-      fetchZlecenia(true);
+      if (isOnline) fetchZlecenia(true);
     } catch (err) {
-      Alert.alert("Błąd bazy.");
+      Alert.alert("Błąd aplikacji.");
     } finally {
       setLoading(false);
       setTimeout(() => { isProcessing.current = false; }, 1000);
@@ -356,7 +423,12 @@ export default function PikowanieScreen() {
 
   if (isCameraOpen) {
     return (
-      <View style={{ flex: 1, backgroundColor: "#000" }}>
+      <SafeAreaView style={{ flex: 1, backgroundColor: "#000" }}>
+        {!isOnline && (
+          <View style={{ width: "100%", backgroundColor: "#ef4444", paddingVertical: 10, alignItems: "center", zIndex: 1000 }}>
+            <Text style={{ color: "white", fontWeight: "bold" }}>⚠️ BRAK INTERNETU - Tryb Offline</Text>
+          </View>
+        )}
         <CameraView style={StyleSheet.absoluteFillObject} facing="back" onBarcodeScanned={({ data }) => {
           if (isProcessing.current) return;
           isProcessing.current = true;
@@ -368,85 +440,107 @@ export default function PikowanieScreen() {
         <TouchableOpacity style={styles.closeCameraButton} onPress={() => setIsCameraOpen(false)}>
           <Text style={styles.buttonText}>ANULUJ I WRÓĆ</Text>
         </TouchableOpacity>
-      </View>
+      </SafeAreaView>
     );
   }
 
+  // --- GŁÓWNA ZMIANA: SafeAreaView zamiast KeyboardAvoidingView na zewnątrz ---
   return (
-    <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === "ios" ? "padding" : "height"}>
-      <Modal visible={isPauseModalVisible} transparent={true} animationType="fade">
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>☕ Wybierz powód pauzy:</Text>
-            <TouchableOpacity style={styles.modalOptionBtn} onPress={() => handleZatwierdzPauze("Śniadanie / Przerwa")}>
-              <Text style={styles.modalOptionText}>☕ Śniadanie / Przerwa</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.modalOptionBtn} onPress={() => handleZatwierdzPauze("Brak nici/materiału")}>
-              <Text style={styles.modalOptionText}>🧵 Brak nici / materiału</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.modalOptionBtn} onPress={() => handleZatwierdzPauze("Awaria maszyny")}>
-              <Text style={styles.modalOptionText}>🛠️ Awaria maszyny</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.modalCancelBtn} onPress={() => setIsPauseModalVisible(false)}>
-              <Text style={styles.modalCancelText}>ANULUJ (Wróć do pracy)</Text>
-            </TouchableOpacity>
-          </View>
+    <SafeAreaView style={{ flex: 1, backgroundColor: "#fffbeb" }}>
+      
+      {/* Pasek Offline na samej górze w SafeAreaView */}
+      {!isOnline && (
+        <View style={{ width: "100%", backgroundColor: "#ef4444", paddingVertical: 10, alignItems: "center", zIndex: 1000 }}>
+          <Text style={{ color: "white", fontWeight: "bold" }}>⚠️ BRAK INTERNETU - Tryb Offline</Text>
+          {zalegleSkany > 0 && <Text style={{ color: "white", fontSize: 12 }}>Oczekujące skany w schowku: {zalegleSkany}</Text>}
         </View>
-      </Modal>
+      )}
 
-      <View style={styles.header}>
-        <Text style={styles.title}>Panel Pikowania</Text>
-        <Text style={styles.subtitle}>Pracownik: {nazwaPracownika}</Text>
-      </View>
-
-      <View style={styles.listWrapper}>
-        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 20, alignItems: "center" }}
-          refreshControl={<RefreshControl refreshing={loading} onRefresh={() => fetchZlecenia(false)} colors={["#f59e0b"]} />}
-        >
-          <View style={styles.card}>
-            <Text style={styles.label}>PODEJMIJ WÓZEK DO PIKOWANIA:</Text>
-            <TextInput style={styles.input} placeholder="Zeskanuj kod lub wpisz numer..." value={kodZlecenia} onChangeText={setKodZlecenia} onSubmitEditing={() => handleSkanujZlecenie()} />
-            <TouchableOpacity style={styles.cameraButton} onPress={async () => {
-              if (!permission?.granted) { const { granted } = await requestPermission(); if (!granted) return; }
-              setIsCameraOpen(true);
-            }}>
-              <Text style={styles.cameraButtonText}>📸 WŁĄCZ SKANER (APARAT)</Text>
-            </TouchableOpacity>
-          </View>
-
-          {!loading && (
-            <View style={{ width: "100%", maxWidth: 500 }}>
-              {zleceniaWTrakcie.length > 0 && (
-                <>
-                  <Text style={styles.sectionHeader}>🟢 W TRAKCIE PIKOWANIA ({zleceniaWTrakcie.length}):</Text>
-                  {zleceniaWTrakcie.map((z) => renderZlecenieAktywne(z))}
-                </>
-              )}
-              {zleceniaZapauzowane.length > 0 && (
-                <>
-                  <Text style={[styles.sectionHeader, { marginTop: 15 }]}>⏸️ WSTRZYMANE NA PAUZIE ({zleceniaZapauzowane.length}):</Text>
-                  {zleceniaZapauzowane.map((z) => renderZlecenieZapauzowane(z))}
-                </>
-              )}
-              <Text style={[styles.sectionHeader, { marginTop: 25 }]}>📋 CZEKAJĄCE OD UBIERALNI ({zleceniaGotowe.length}):</Text>
-              {zleceniaGotowe.length === 0 && <Text style={styles.emptyText}>Brak wózków do pikowania.</Text>}
-              {zleceniaGotowe.map((z) => renderZlecenieOczekujace(z))}
+      <KeyboardAvoidingView 
+        style={[styles.container, !isOnline && { paddingTop: 10 }]} // Zmniejszamy margines jak jest pasek
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+      >
+        <Modal visible={isPauseModalVisible} transparent={true} animationType="fade">
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>☕ Wybierz powód pauzy:</Text>
+              <TouchableOpacity style={styles.modalOptionBtn} onPress={() => handleZatwierdzPauze("Śniadanie / Przerwa")}>
+                <Text style={styles.modalOptionText}>☕ Śniadanie / Przerwa</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalOptionBtn} onPress={() => handleZatwierdzPauze("Brak nici/materiału")}>
+                <Text style={styles.modalOptionText}>🧵 Brak nici / materiału</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalOptionBtn} onPress={() => handleZatwierdzPauze("Awaria maszyny")}>
+                <Text style={styles.modalOptionText}>🛠️ Awaria maszyny</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalCancelBtn} onPress={() => setIsPauseModalVisible(false)}>
+                <Text style={styles.modalCancelText}>ANULUJ (Wróć do pracy)</Text>
+              </TouchableOpacity>
             </View>
-          )}
-        </ScrollView>
-      </View>
+          </View>
+        </Modal>
 
-      <View style={styles.footerContainer}>
+        <View style={styles.header}>
+          <Text style={styles.title}>Panel Pikowania</Text>
+          <Text style={styles.subtitle}>Pracownik: {nazwaPracownika}</Text>
+        </View>
+
+        <View style={styles.listWrapper}>
+          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 20, alignItems: "center" }}
+            refreshControl={<RefreshControl refreshing={loading} onRefresh={() => fetchZlecenia(false)} colors={["#f59e0b"]} />}
+          >
+            <View style={styles.card}>
+              <Text style={styles.label}>PODEJMIJ WÓZEK DO PIKOWANIA:</Text>
+              <TextInput style={styles.input} placeholder="Zeskanuj kod lub wpisz numer..." value={kodZlecenia} onChangeText={setKodZlecenia} onSubmitEditing={() => handleSkanujZlecenie()} />
+              <TouchableOpacity style={styles.cameraButton} onPress={async () => {
+                if (!permission?.granted) { const { granted } = await requestPermission(); if (!granted) return; }
+                setIsCameraOpen(true);
+              }}>
+                <Text style={styles.cameraButtonText}>📸 WŁĄCZ SKANER (APARAT)</Text>
+              </TouchableOpacity>
+            </View>
+
+            {!loading && (
+              <View style={{ width: "100%", maxWidth: 500 }}>
+                {zleceniaWTrakcie.length > 0 && (
+                  <>
+                    <Text style={styles.sectionHeader}>🟢 W TRAKCIE PIKOWANIA ({zleceniaWTrakcie.length}):</Text>
+                    {zleceniaWTrakcie.map((z) => renderZlecenieAktywne(z))}
+                  </>
+                )}
+                {zleceniaZapauzowane.length > 0 && (
+                  <>
+                    <Text style={[styles.sectionHeader, { marginTop: 15 }]}>⏸️ WSTRZYMANE NA PAUZIE ({zleceniaZapauzowane.length}):</Text>
+                    {zleceniaZapauzowane.map((z) => renderZlecenieZapauzowane(z))}
+                  </>
+                )}
+                <Text style={[styles.sectionHeader, { marginTop: 25 }]}>📋 CZEKAJĄCE OD UBIERALNI ({zleceniaGotowe.length}):</Text>
+                {zleceniaGotowe.length === 0 && <Text style={styles.emptyText}>Brak wózków do pikowania.</Text>}
+                {zleceniaGotowe.map((z) => renderZlecenieOczekujace(z))}
+              </View>
+            )}
+          </ScrollView>
+        </View>
+
+        <View style={styles.footerContainer}>
+          <TouchableOpacity 
+          style={[styles.logoutButton, { backgroundColor: "#3b82f6", marginBottom: 10 }]} 
+          onPress={() => router.push({ pathname: "/wybor-dzialu", params: { idPracownika, nazwaPracownika, rola } })}
+        >
+          <Text style={styles.buttonText}>🔄 ZMIEŃ DZIAŁ (ZASTĘPSTWO)</Text>
+        </TouchableOpacity>
+
         <TouchableOpacity style={styles.logoutButton} onPress={() => router.replace("/")}>
           <Text style={styles.buttonText}>ZAKOŃCZ ZMIANĘ (WYLOGUJ)</Text>
         </TouchableOpacity>
-      </View>
-    </KeyboardAvoidingView>
+        </View>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#fffbeb", paddingTop: 50 },
+  container: { flex: 1, backgroundColor: "#fffbeb", paddingTop: 50 }, // Margines dla układu normalnego
   header: { alignItems: "center", marginBottom: 15 },
   title: { fontSize: 26, fontWeight: "900", color: "#0f172a" },
   subtitle: { fontSize: 14, color: "#f59e0b", fontWeight: "bold" },

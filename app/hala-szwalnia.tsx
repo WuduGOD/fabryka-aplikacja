@@ -1,4 +1,5 @@
 import { CameraView, useCameraPermissions } from "expo-camera";
+import * as Network from "expo-network";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import React, { useEffect, useRef, useState } from "react";
 import {
@@ -9,6 +10,7 @@ import {
   Modal,
   Platform,
   RefreshControl,
+  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
@@ -16,11 +18,12 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { SyncManager } from "../components/SyncManager";
 import { supabase } from "../supabase";
 
 export default function SzwalniaScreen() {
   const router = useRouter();
-  const { idPracownika, nazwaPracownika } = useLocalSearchParams();
+  const { idPracownika, nazwaPracownika, rola } = useLocalSearchParams();
 
   const [kodZlecenia, setKodZlecenia] = useState("");
   const [permission, requestPermission] = useCameraPermissions();
@@ -37,6 +40,10 @@ export default function SzwalniaScreen() {
   );
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // --- STANY OFFLINE ---
+  const [isOnline, setIsOnline] = useState(true);
+  const [zalegleSkany, setZalegleSkany] = useState(0);
 
   const [isPauseModalVisible, setIsPauseModalVisible] = useState(false);
   const [zlecenieDoPauzy, setZlecenieDoPauzy] = useState<any>(null);
@@ -116,42 +123,41 @@ export default function SzwalniaScreen() {
   useEffect(() => {
     fetchZlecenia();
 
-    // Podpinamy nasłuch na żywo dla Krawcowych
+    // --- CZUJNIK OFFLINE ---
+    const netInterval = setInterval(async () => {
+      const netInfo = await Network.getNetworkStateAsync();
+      setIsOnline(!!(netInfo.isConnected && netInfo.isInternetReachable));
+      setZalegleSkany(await SyncManager.pobierzIloscWklejce());
+    }, 3000);
+
     const subskrypcja = supabase
       .channel("zmiany_szwalnia")
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "zlecenia" },
         (payload) => {
-          // Ciche odświeżanie, gdy Krojcza wyśle wózek do szycia
           fetchZlecenia(true);
         },
       )
       .subscribe();
 
     return () => {
+      clearInterval(netInterval);
       supabase.removeChannel(subskrypcja);
     };
   }, []);
 
-  // --- FILTR UWAG DLA SZWALNI ---
   const filtrujUwagiSzwalni = (instrukcje: string) => {
     if (!instrukcje) return "";
-
-    // Szukamy słowa "PRODUKCJA" (lub "produkcja") i ucinamy wszystko od tego momentu
     const czesci = instrukcje.split(/PRODUKCJA/i);
-
-    // Zwracamy tylko pierwszą część (to co było przed słowem PRODUKCJA), czyszcząc białe znaki
     return czesci[0].trim();
   };
 
-  // --- KULOODPORNE ZAMYKANIE CZASU ---
   const handleStartPozycji = async (
     zlecenieId: string,
     pozycjaId: string,
     idFirmy: string,
   ) => {
-    // 1. Błyskawiczna zmiana ekranu na zielony
     const tymczasowyLogId = "temp-" + Date.now();
     setWszystkieLogiPracownika((prev) => {
       const zamknieteStare = prev.map((l) =>
@@ -170,35 +176,49 @@ export default function SzwalniaScreen() {
       ];
     });
 
-    // Zabezpieczenie przed "podwójnym kliknięciem" na ten sam guzik
     const aktywnyLog = wszystkieLogiPracownika.find(
       (l) => l.czas_stop === null,
     );
     if (aktywnyLog && aktywnyLog.id_pozycji === pozycjaId) return;
 
-    // 2. POTĘŻNA KOMENDA DO BAZY: Zamknij bezwzględnie wszystkie otwarte czasy tej krawcowej!
-    await supabase
-      .from("logi_pracy")
-      .update({ czas_stop: new Date().toISOString() })
-      .eq("id_pracownika", idPracownika)
-      .eq("etap_pracy", "szycie")
-      .is("czas_stop", null);
+    if (isOnline) {
+      // ONLINE
+      await supabase
+        .from("logi_pracy")
+        .update({ czas_stop: new Date().toISOString() })
+        .match({ id_pracownika: idPracownika, etap_pracy: "szycie" }) // <-- Użyto match dla bezpieczeństwa
+        .is("czas_stop", null);
 
-    // 3. Start nowego czasu
-    const { error: errInsert } = await supabase.from("logi_pracy").insert([
-      {
+      const { error: errInsert } = await supabase.from("logi_pracy").insert([
+        {
+          id_zlecenia: zlecenieId,
+          id_pracownika: idPracownika,
+          id_firmy: idFirmy,
+          etap_pracy: "szycie",
+          id_pozycji: pozycjaId,
+        },
+      ]);
+
+      if (errInsert) {
+        Alert.alert("Błąd zapisu (Baza Danych)", errInsert.message);
+      }
+      fetchZlecenia(true);
+    } else {
+      // OFFLINE
+      await SyncManager.dodajDoKolejki(
+        "logi_pracy",
+        "UPDATE",
+        { czas_stop: new Date().toISOString() },
+        { id_pracownika: idPracownika, etap_pracy: "szycie", czas_stop: null },
+      );
+      await SyncManager.dodajDoKolejki("logi_pracy", "INSERT", {
         id_zlecenia: zlecenieId,
         id_pracownika: idPracownika,
         id_firmy: idFirmy,
         etap_pracy: "szycie",
         id_pozycji: pozycjaId,
-      },
-    ]);
-
-    if (errInsert) {
-      Alert.alert("Błąd zapisu (Baza Danych)", errInsert.message);
+      });
     }
-    fetchZlecenia(true);
   };
 
   const handleZatwierdzPauze = async (powod: string) => {
@@ -217,15 +237,24 @@ export default function SzwalniaScreen() {
       ),
     );
 
-    // Zamykamy bazę z powodem pauzy
-    await supabase
-      .from("logi_pracy")
-      .update({ czas_stop: new Date().toISOString(), uwagi: `PAUZA: ${powod}` })
-      .eq("id_pracownika", idPracownika)
-      .eq("etap_pracy", "szycie")
-      .is("czas_stop", null);
-
-    fetchZlecenia(true);
+    if (isOnline) {
+      await supabase
+        .from("logi_pracy")
+        .update({
+          czas_stop: new Date().toISOString(),
+          uwagi: `PAUZA: ${powod}`,
+        })
+        .match({ id_pracownika: idPracownika, etap_pracy: "szycie" })
+        .is("czas_stop", null);
+      fetchZlecenia(true);
+    } else {
+      await SyncManager.dodajDoKolejki(
+        "logi_pracy",
+        "UPDATE",
+        { czas_stop: new Date().toISOString(), uwagi: `PAUZA: ${powod}` },
+        { id_pracownika: idPracownika, etap_pracy: "szycie", czas_stop: null },
+      );
+    }
     setZlecenieDoPauzy(null);
   };
 
@@ -245,53 +274,103 @@ export default function SzwalniaScreen() {
       ...prev,
     ]);
 
-    const { error } = await supabase.from("logi_pracy").insert([
-      {
+    if (isOnline) {
+      const { error } = await supabase.from("logi_pracy").insert([
+        {
+          id_zlecenia: zlecenieId,
+          id_pracownika: idPracownika,
+          id_firmy: idFirmy,
+          etap_pracy: "szycie",
+          id_pozycji: pozycjaId,
+        },
+      ]);
+      if (error) Alert.alert("Błąd wznawiania", error.message);
+      fetchZlecenia(true);
+    } else {
+      await SyncManager.dodajDoKolejki("logi_pracy", "INSERT", {
         id_zlecenia: zlecenieId,
         id_pracownika: idPracownika,
         id_firmy: idFirmy,
         etap_pracy: "szycie",
         id_pozycji: pozycjaId,
-      },
-    ]);
-    if (error) Alert.alert("Błąd wznawiania", error.message);
-    fetchZlecenia(true);
+      });
+    }
   };
 
   const handleZakonczWozekRaw = async (zlecenie: any) => {
     const wykonajZakonczenie = async () => {
       setLoading(true);
       try {
-        // Niezawodne zatrzymanie czasu na sam koniec dla całego wózka
-        await supabase
-          .from("logi_pracy")
-          .update({ czas_stop: new Date().toISOString() })
-          .eq("id_pracownika", idPracownika)
-          .eq("etap_pracy", "szycie")
-          .is("czas_stop", null);
+        if (isOnline) {
+          // ONLINE
+          await supabase
+            .from("logi_pracy")
+            .update({ czas_stop: new Date().toISOString() })
+            .match({ id_pracownika: idPracownika, etap_pracy: "szycie" })
+            .is("czas_stop", null);
 
-        await supabase
-          .from("zlecenia")
-          .update({ status: "do_kontroli" })
-          .eq("id", zlecenie.id);
-        await supabase.from("historia_statusow").insert([
-          {
+          await supabase
+            .from("zlecenia")
+            .update({ status: "do_kontroli" })
+            .eq("id", zlecenie.id);
+
+          await supabase.from("historia_statusow").insert([
+            {
+              id_zlecenia: zlecenie.id,
+              id_pracownika: idPracownika,
+              id_firmy: zlecenie.id_firmy,
+              stary_status: "szycie_w_trakcie",
+              nowy_status: "do_kontroli",
+            },
+          ]);
+
+          if (Platform.OS === "web") {
+            window.alert(
+              `Super! Wózek ${zlecenie.numer_zd} oddany do kontroli.`,
+            );
+          } else {
+            Alert.alert("Super!", `Wózek jedzie do kontroli!`);
+          }
+        } else {
+          // OFFLINE
+          await SyncManager.dodajDoKolejki(
+            "logi_pracy",
+            "UPDATE",
+            { czas_stop: new Date().toISOString() },
+            {
+              id_pracownika: idPracownika,
+              etap_pracy: "szycie",
+              czas_stop: null,
+            },
+          );
+          await SyncManager.dodajDoKolejki(
+            "zlecenia",
+            "UPDATE",
+            { status: "do_kontroli" },
+            zlecenie.id,
+          );
+          await SyncManager.dodajDoKolejki("historia_statusow", "INSERT", {
             id_zlecenia: zlecenie.id,
             id_pracownika: idPracownika,
             id_firmy: zlecenie.id_firmy,
             stary_status: "szycie_w_trakcie",
             nowy_status: "do_kontroli",
-          },
-        ]);
+          });
 
-        if (Platform.OS === "web") {
-          window.alert(`Super! Wózek ${zlecenie.numer_zd} oddany do kontroli.`);
-        } else {
-          Alert.alert("Super!", `Wózek jedzie do kontroli!`);
+          if (Platform.OS === "web") {
+            window.alert(`Koniec produkcji (Offline)! Zapisano w kolejce.`);
+          } else {
+            Alert.alert("Gotowe (Offline)!", `Zapisano w kolejce.`);
+          }
+
+          setZleceniaWTrakcie((prev) =>
+            prev.filter((z) => z.id !== zlecenie.id),
+          );
         }
 
         setExpandedId(null);
-        fetchZlecenia();
+        setLoading(false);
+        if (isOnline) fetchZlecenia(true);
       } catch (e) {
         if (Platform.OS === "web") window.alert("Błąd zapisu.");
         else Alert.alert("Błąd zapisu.");
@@ -315,6 +394,7 @@ export default function SzwalniaScreen() {
       );
     }
   };
+
   const handleSkanujZlecenie = async (zeskanowanyKod?: string) => {
     const kodRaw =
       typeof zeskanowanyKod === "string" ? zeskanowanyKod : kodZlecenia;
@@ -327,27 +407,36 @@ export default function SzwalniaScreen() {
       setLoading(true);
       const czesci = kodRaw.split("^");
       const numerZD = czesci[0].trim();
-      const { data: zlecenie } = await supabase
-        .from("zlecenia")
-        .select("*")
-        .eq("numer_zd", numerZD)
-        .single();
+
+      // ZMIANA OFFLINE: Szukamy lokalnie
+      const wszystkieLokalne = [
+        ...zleceniaGotowe,
+        ...zleceniaWTrakcie,
+        ...zleceniaZapauzowane,
+      ];
+      const zlecenie = wszystkieLokalne.find((z) => z.numer_zd === numerZD);
+
       if (!zlecenie) {
-        Alert.alert("Błąd", `Nie znaleziono ZD: ${numerZD}`);
+        Alert.alert("Błąd", `Nie znaleziono ZD na liście: ${numerZD}`);
+        setLoading(false);
+        isProcessing.current = false;
         return;
       }
 
       const aktualnyStatus = zlecenie.status;
+
       if (["nowe", "krojenie_w_trakcie"].includes(aktualnyStatus)) {
         Alert.alert("Błąd", "Zlecenie jest w Krojowni.");
         setIsCameraOpen(false);
         isProcessing.current = false;
+        setLoading(false);
         return;
       }
       if (["do_kontroli", "zrealizowane"].includes(aktualnyStatus)) {
         Alert.alert("Gotowe!", "Zlecenie jest w Kontroli lub Magazynie.");
         setIsCameraOpen(false);
         isProcessing.current = false;
+        setLoading(false);
         return;
       }
 
@@ -355,19 +444,41 @@ export default function SzwalniaScreen() {
         aktualnyStatus === "gotowe_do_szycia" ||
         aktualnyStatus === "do_poprawki"
       ) {
-        await supabase
-          .from("zlecenia")
-          .update({ status: "szycie_w_trakcie" })
-          .eq("id", zlecenie.id);
-        await supabase.from("historia_statusow").insert([
-          {
+        if (isOnline) {
+          await supabase
+            .from("zlecenia")
+            .update({ status: "szycie_w_trakcie" })
+            .eq("id", zlecenie.id);
+          await supabase.from("historia_statusow").insert([
+            {
+              id_zlecenia: zlecenie.id,
+              id_pracownika: idPracownika,
+              id_firmy: zlecenie.id_firmy,
+              stary_status: aktualnyStatus,
+              nowy_status: "szycie_w_trakcie",
+            },
+          ]);
+        } else {
+          await SyncManager.dodajDoKolejki(
+            "zlecenia",
+            "UPDATE",
+            { status: "szycie_w_trakcie" },
+            zlecenie.id,
+          );
+          await SyncManager.dodajDoKolejki("historia_statusow", "INSERT", {
             id_zlecenia: zlecenie.id,
             id_pracownika: idPracownika,
             id_firmy: zlecenie.id_firmy,
             stary_status: aktualnyStatus,
             nowy_status: "szycie_w_trakcie",
-          },
-        ]);
+          });
+
+          setZleceniaGotowe((prev) => prev.filter((z) => z.id !== zlecenie.id));
+          setZleceniaWTrakcie((prev) => [
+            ...prev,
+            { ...zlecenie, status: "szycie_w_trakcie" },
+          ]);
+        }
         setExpandedId(zlecenie.id);
       } else {
         setExpandedId(zlecenie.id);
@@ -376,7 +487,7 @@ export default function SzwalniaScreen() {
       setKodZlecenia("");
       setIsCameraOpen(false);
       Keyboard.dismiss();
-      fetchZlecenia();
+      if (isOnline) fetchZlecenia(true);
     } catch (err) {
       Alert.alert("Błąd bazy.");
       setLoading(false);
@@ -470,7 +581,6 @@ export default function SzwalniaScreen() {
                     </Text>
                   </View>
 
-                  {/* ZMIANA: Wyświetlamy tylko przefiltrowane uwagi */}
                   {prod.instrukcje &&
                   filtrujUwagiSzwalni(prod.instrukcje).length > 0 ? (
                     <View style={styles.instrukcjeBox}>
@@ -577,7 +687,22 @@ export default function SzwalniaScreen() {
 
   if (isCameraOpen) {
     return (
-      <View style={{ flex: 1, backgroundColor: "#000" }}>
+      <SafeAreaView style={{ flex: 1, backgroundColor: "#000" }}>
+        {!isOnline && (
+          <View
+            style={{
+              width: "100%",
+              backgroundColor: "#ef4444",
+              paddingVertical: 10,
+              alignItems: "center",
+              zIndex: 1000,
+            }}
+          >
+            <Text style={{ color: "white", fontWeight: "bold" }}>
+              ⚠️ BRAK INTERNETU - Tryb Offline
+            </Text>
+          </View>
+        )}
         <CameraView
           style={StyleSheet.absoluteFillObject}
           facing="back"
@@ -596,152 +721,198 @@ export default function SzwalniaScreen() {
         >
           <Text style={styles.buttonText}>ANULUJ I WRÓĆ</Text>
         </TouchableOpacity>
-      </View>
+      </SafeAreaView>
     );
   }
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === "ios" ? "padding" : "height"}
-    >
-      <Modal
-        visible={isPauseModalVisible}
-        transparent={true}
-        animationType="fade"
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>☕ Wybierz powód pauzy:</Text>
-            <TouchableOpacity
-              style={styles.modalOptionBtn}
-              onPress={() => handleZatwierdzPauze("Śniadanie / Przerwa")}
-            >
-              <Text style={styles.modalOptionText}>☕ Śniadanie / Przerwa</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.modalOptionBtn}
-              onPress={() => handleZatwierdzPauze("Brak materiału")}
-            >
-              <Text style={styles.modalOptionText}>🧵 Brak materiału</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.modalOptionBtn}
-              onPress={() => handleZatwierdzPauze("Awaria")}
-            >
-              <Text style={styles.modalOptionText}>🛠️ Awaria maszyny</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.modalOptionBtn}
-              onPress={() => handleZatwierdzPauze("Toaleta")}
-            >
-              <Text style={styles.modalOptionText}>🚽 Toaleta</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.modalCancelBtn}
-              onPress={() => setIsPauseModalVisible(false)}
-            >
-              <Text style={styles.modalCancelText}>ANULUJ (Wróć do pracy)</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
-
-      <View style={styles.header}>
-        <Text style={styles.title}>Panel Szwalni</Text>
-        <Text style={styles.subtitle}>Pracownik: {nazwaPracownika}</Text>
-      </View>
-
-      <View style={styles.listWrapper}>
-        <ScrollView
-          showsVerticalScrollIndicator={false}
-          contentContainerStyle={{ paddingBottom: 20, alignItems: "center" }}
-          refreshControl={
-            <RefreshControl
-              refreshing={loading}
-              onRefresh={() => fetchZlecenia(false)}
-              colors={["#ec4899"]}
-            />
-          }
-          keyboardShouldPersistTaps="handled"
-          keyboardDismissMode="on-drag"
+    <SafeAreaView style={{ flex: 1, backgroundColor: "#fdf4ff" }}>
+      {/* Pasek Offline */}
+      {!isOnline && (
+        <View
+          style={{
+            width: "100%",
+            backgroundColor: "#ef4444",
+            paddingVertical: 10,
+            alignItems: "center",
+            zIndex: 1000,
+          }}
         >
-          <View style={styles.card}>
-            <Text style={styles.label}>PODEJMIJ NOWY WÓZEK ZD:</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Zeskanuj kod lub wpisz numer..."
-              value={kodZlecenia}
-              onChangeText={setKodZlecenia}
-              onSubmitEditing={() => handleSkanujZlecenie()}
-            />
-            <TouchableOpacity
-              style={styles.cameraButton}
-              onPress={async () => {
-                if (!permission?.granted) {
-                  const { granted } = await requestPermission();
-                  if (!granted) return;
-                }
-                setIsCameraOpen(true);
-              }}
-            >
-              <Text style={styles.cameraButtonText}>
-                📸 WŁĄCZ SKANER (APARAT)
-              </Text>
-            </TouchableOpacity>
-          </View>
-
-          {loading ? (
-            <ActivityIndicator
-              size="large"
-              color="#ec4899"
-              style={{ marginTop: 30 }}
-            />
-          ) : (
-            <View style={{ width: "100%", maxWidth: 500 }}>
-              {zleceniaWTrakcie.length > 0 && (
-                <>
-                  <Text style={styles.sectionHeader}>
-                    🟢 TWOJE WÓZKI W TRAKCIE PRACY ({zleceniaWTrakcie.length}):
-                  </Text>
-                  {zleceniaWTrakcie.map((z) => renderZlecenieAktywne(z))}
-                </>
-              )}
-              {zleceniaZapauzowane.length > 0 && (
-                <>
-                  <Text style={[styles.sectionHeader, { marginTop: 15 }]}>
-                    ⏸️ WSTRZYMANE NA PAUZIE ({zleceniaZapauzowane.length}):
-                  </Text>
-                  {zleceniaZapauzowane.map((z) => renderZlecenieZapauzowane(z))}
-                </>
-              )}
-              <Text style={[styles.sectionHeader, { marginTop: 25 }]}>
-                📋 CZEKAJĄCE WÓZKI (Od krojczej) ({zleceniaGotowe.length}):
-              </Text>
-              {zleceniaGotowe.length === 0 && (
-                <Text style={styles.emptyText}>Brak wózków od krojczej.</Text>
-              )}
-              {zleceniaGotowe.map((z) =>
-                renderZlecenieOczekujace(
-                  z,
-                  "#8b5cf6",
-                  "Zeskanuj kod ZD by wziąć wózek",
-                ),
-              )}
-            </View>
+          <Text style={{ color: "white", fontWeight: "bold" }}>
+            ⚠️ BRAK INTERNETU - Tryb Offline
+          </Text>
+          {zalegleSkany > 0 && (
+            <Text style={{ color: "white", fontSize: 12 }}>
+              Oczekujące skany w schowku: {zalegleSkany}
+            </Text>
           )}
-        </ScrollView>
-      </View>
+        </View>
+      )}
 
-      <View style={styles.footerContainer}>
-        <TouchableOpacity
-          style={styles.logoutButton}
-          onPress={() => router.replace("/")}
+      <KeyboardAvoidingView
+        style={[styles.container, !isOnline && { paddingTop: 10 }]} // Zmniejszony margines jeśli jest pasek
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+      >
+        <Modal
+          visible={isPauseModalVisible}
+          transparent={true}
+          animationType="fade"
         >
-          <Text style={styles.buttonText}>ZAKOŃCZ ZMIANĘ (WYLOGUJ)</Text>
-        </TouchableOpacity>
-      </View>
-    </KeyboardAvoidingView>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>☕ Wybierz powód pauzy:</Text>
+              <TouchableOpacity
+                style={styles.modalOptionBtn}
+                onPress={() => handleZatwierdzPauze("Śniadanie / Przerwa")}
+              >
+                <Text style={styles.modalOptionText}>
+                  ☕ Śniadanie / Przerwa
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalOptionBtn}
+                onPress={() => handleZatwierdzPauze("Brak materiału")}
+              >
+                <Text style={styles.modalOptionText}>🧵 Brak materiału</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalOptionBtn}
+                onPress={() => handleZatwierdzPauze("Awaria")}
+              >
+                <Text style={styles.modalOptionText}>🛠️ Awaria maszyny</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalOptionBtn}
+                onPress={() => handleZatwierdzPauze("Toaleta")}
+              >
+                <Text style={styles.modalOptionText}>🚽 Toaleta</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalCancelBtn}
+                onPress={() => setIsPauseModalVisible(false)}
+              >
+                <Text style={styles.modalCancelText}>
+                  ANULUJ (Wróć do pracy)
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
+        <View style={styles.header}>
+          <Text style={styles.title}>Panel Szwalni</Text>
+          <Text style={styles.subtitle}>Pracownik: {nazwaPracownika}</Text>
+        </View>
+
+        <View style={styles.listWrapper}>
+          <ScrollView
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={{ paddingBottom: 20, alignItems: "center" }}
+            refreshControl={
+              <RefreshControl
+                refreshing={loading}
+                onRefresh={() => fetchZlecenia(false)}
+                colors={["#ec4899"]}
+              />
+            }
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="on-drag"
+          >
+            <View style={styles.card}>
+              <Text style={styles.label}>PODEJMIJ NOWY WÓZEK ZD:</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Zeskanuj kod lub wpisz numer..."
+                value={kodZlecenia}
+                onChangeText={setKodZlecenia}
+                onSubmitEditing={() => handleSkanujZlecenie()}
+              />
+              <TouchableOpacity
+                style={styles.cameraButton}
+                onPress={async () => {
+                  if (!permission?.granted) {
+                    const { granted } = await requestPermission();
+                    if (!granted) return;
+                  }
+                  setIsCameraOpen(true);
+                }}
+              >
+                <Text style={styles.cameraButtonText}>
+                  📸 WŁĄCZ SKANER (APARAT)
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {loading ? (
+              <ActivityIndicator
+                size="large"
+                color="#ec4899"
+                style={{ marginTop: 30 }}
+              />
+            ) : (
+              <View style={{ width: "100%", maxWidth: 500 }}>
+                {zleceniaWTrakcie.length > 0 && (
+                  <>
+                    <Text style={styles.sectionHeader}>
+                      🟢 TWOJE WÓZKI W TRAKCIE PRACY ({zleceniaWTrakcie.length}
+                      ):
+                    </Text>
+                    {zleceniaWTrakcie.map((z) => renderZlecenieAktywne(z))}
+                  </>
+                )}
+                {zleceniaZapauzowane.length > 0 && (
+                  <>
+                    <Text style={[styles.sectionHeader, { marginTop: 15 }]}>
+                      ⏸️ WSTRZYMANE NA PAUZIE ({zleceniaZapauzowane.length}):
+                    </Text>
+                    {zleceniaZapauzowane.map((z) =>
+                      renderZlecenieZapauzowane(z),
+                    )}
+                  </>
+                )}
+                <Text style={[styles.sectionHeader, { marginTop: 25 }]}>
+                  📋 CZEKAJĄCE WÓZKI (Od krojczej) ({zleceniaGotowe.length}):
+                </Text>
+                {zleceniaGotowe.length === 0 && (
+                  <Text style={styles.emptyText}>Brak wózków od krojczej.</Text>
+                )}
+                {zleceniaGotowe.map((z) =>
+                  renderZlecenieOczekujace(
+                    z,
+                    "#8b5cf6",
+                    "Zeskanuj kod ZD by wziąć wózek",
+                  ),
+                )}
+              </View>
+            )}
+          </ScrollView>
+        </View>
+
+        <View style={styles.footerContainer}>
+          <TouchableOpacity
+            style={[
+              styles.logoutButton,
+              { backgroundColor: "#3b82f6", marginBottom: 10 },
+            ]}
+            onPress={() =>
+              router.push({
+                pathname: "/wybor-dzialu",
+                params: { idPracownika, nazwaPracownika, rola },
+              })
+            }
+          >
+            <Text style={styles.buttonText}>🔄 ZMIEŃ DZIAŁ (ZASTĘPSTWO)</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.logoutButton}
+            onPress={() => router.replace("/")}
+          >
+            <Text style={styles.buttonText}>ZAKOŃCZ ZMIANĘ (WYLOGUJ)</Text>
+          </TouchableOpacity>
+        </View>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 
