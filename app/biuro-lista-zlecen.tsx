@@ -2,7 +2,9 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
+  Platform,
   StyleSheet,
   Text,
   TextInput,
@@ -15,8 +17,10 @@ import { supabase } from "../supabase";
 export default function BiuroListaZlecenScreen() {
   const router = useRouter();
   const { idPracownika, nazwaPracownika } = useLocalSearchParams();
+  const bezpieczneId = Array.isArray(idPracownika)
+    ? idPracownika[0]
+    : idPracownika;
 
-  // Flaga ratująca przed błędem 418 (hydracja po odświeżeniu)
   const [isMounted, setIsMounted] = useState(false);
   const [zlecenia, setZlecenia] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -39,15 +43,12 @@ export default function BiuroListaZlecenScreen() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "zlecenia" },
-        (payload) => {
-          // Ktoś na hali zmienił status zlecenia!
-          // Przekazujemy "true", żeby odświeżenie listy było ciche i nie przerywało pracy
+        () => {
           fetchZlecenia(true);
         },
       )
       .subscribe();
 
-    // Sprzątamy po wyjściu z panelu
     return () => {
       supabase.removeChannel(subskrypcja);
     };
@@ -73,9 +74,13 @@ export default function BiuroListaZlecenScreen() {
   const getStatusColor = (status: string) => {
     switch (status) {
       case "nowe":
-        return "#3b82f6"; // Niebieski
+      case "oczekuje_kierownik":
+      case "oczekuje_krojownia":
+        return "#3b82f6"; // Niebieski (Początkowe)
       case "krojenie_w_trakcie":
-        return "#f59e0b"; // Pomarańczowy
+      case "pikowanie_w_trakcie":
+      case "ubieranie_w_trakcie":
+        return "#f59e0b"; // Pomarańczowy (W trakcie produkcji)
       case "gotowe_do_szycia":
         return "#8b5cf6"; // Fioletowy
       case "szycie_w_trakcie":
@@ -85,16 +90,113 @@ export default function BiuroListaZlecenScreen() {
       case "do_poprawki":
         return "#ef4444"; // Czerwony
       case "zrealizowane":
+      case "do_wysylki":
         return "#10b981"; // Zielony
+      case "anulowane":
+        return "#1e293b"; // Ciemny / Czarny (Anulowane)
       default:
         return "#64748b"; // Szary
     }
   };
 
-  // Tłumacz tekst statusu (zamienia podłogi na spacje)
+  // Tłumacz tekst statusu
   const formatStatusText = (status: string) => {
     if (!status) return "NIEZNANY";
     return status.replace(/_/g, " ").toUpperCase();
+  };
+
+  // --- LOGIKA USUWANIA LUB ANULOWANIA ZLECENIA ---
+  const handleDeleteOrCancel = (item: any) => {
+    const isNew = ["nowe", "oczekuje_kierownik", "oczekuje_krojownia"].includes(
+      item.status,
+    );
+    const actionType = isNew ? "USUNIĘCIE ZLECENIA" : "ANULOWANIE ZLECENIA";
+    const message = isNew
+      ? `To zlecenie nie trafiło jeszcze na produkcję.\nCzy na pewno chcesz je TRWALE USUNĄĆ?`
+      : `UWAGA! Zlecenie ${item.numer_zd} jest już w trakcie produkcji (Status: ${formatStatusText(item.status)}).\n\nNie można go trwale usunąć. Zostanie przerwane i ANULOWANE.\nCzy potwierdzasz?`;
+
+    const performAction = async () => {
+      setLoading(true);
+      try {
+        if (isNew) {
+          // Trwałe usunięcie (Manualny kaskadowy delete dla pewności)
+          await supabase
+            .from("pozycje_zlecenia")
+            .delete()
+            .eq("id_zlecenia", item.id);
+          await supabase
+            .from("historia_statusow")
+            .delete()
+            .eq("id_zlecenia", item.id);
+          await supabase.from("logi_pracy").delete().eq("id_zlecenia", item.id);
+          const { error } = await supabase
+            .from("zlecenia")
+            .delete()
+            .eq("id", item.id);
+
+          if (error) throw error;
+
+          if (Platform.OS === "web")
+            window.alert(
+              `Zlecenie ${item.numer_zd} zostało całkowicie usunięte z bazy.`,
+            );
+          else
+            Alert.alert(
+              "Usunięto",
+              `Zlecenie ${item.numer_zd} zostało usunięte.`,
+            );
+        } else {
+          // Zatrzymanie / Anulowanie w trakcie
+          const { error } = await supabase
+            .from("zlecenia")
+            .update({ status: "anulowane" })
+            .eq("id", item.id);
+          if (error) throw error;
+
+          if (bezpieczneId) {
+            await supabase.from("historia_statusow").insert([
+              {
+                id_zlecenia: item.id,
+                id_pracownika: bezpieczneId,
+                id_firmy: item.id_firmy,
+                stary_status: item.status,
+                nowy_status: "anulowane",
+              },
+            ]);
+          }
+
+          if (Platform.OS === "web")
+            window.alert(
+              `Zlecenie ${item.numer_zd} zostało pomyślnie ANULOWANE.`,
+            );
+          else
+            Alert.alert(
+              "Anulowano",
+              `Produkcja ZD ${item.numer_zd} została zatrzymana.`,
+            );
+        }
+        fetchZlecenia(true);
+      } catch (err: any) {
+        Alert.alert("Błąd", err.message || "Nie udało się wykonać akcji.");
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    if (Platform.OS === "web") {
+      if (window.confirm(`${actionType}\n\n${message}`)) {
+        performAction();
+      }
+    } else {
+      Alert.alert(actionType, message, [
+        { text: "Wróć", style: "cancel" },
+        {
+          text: isNew ? "Tak, usuń trwale" : "Tak, zatrzymaj (Anuluj)",
+          style: "destructive",
+          onPress: performAction,
+        },
+      ]);
+    }
   };
 
   const renderItem = ({ item }: { item: any }) => {
@@ -102,13 +204,16 @@ export default function BiuroListaZlecenScreen() {
       day: "2-digit",
       month: "2-digit",
       year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
     });
+
+    const isCanceled = item.status === "anulowane";
 
     return (
       <TouchableOpacity
-        style={styles.zlecenieCard}
+        style={[styles.zlecenieCard, isCanceled && { opacity: 0.6 }]}
         onPress={() =>
-          // Przekierowanie na detale biura
           router.push({
             pathname: "/biuro-zlecenie-detale",
             params: { id: item.id },
@@ -116,8 +221,49 @@ export default function BiuroListaZlecenScreen() {
         }
       >
         <View style={styles.zlecenieHeader}>
-          <Text style={styles.numerZD}>{item.numer_zd}</Text>
-          <Text style={styles.chevronIcon}>›</Text>
+          <Text
+            style={[
+              styles.numerZD,
+              isCanceled && {
+                textDecorationLine: "line-through",
+                color: "#64748b",
+              },
+            ]}
+          >
+            {item.numer_zd}
+          </Text>
+
+          <View style={styles.actionIconsRow}>
+            {/* PRZYCISK EDYCJI */}
+            {!isCanceled && (
+              <TouchableOpacity
+                style={styles.iconButton}
+                onPress={(e) => {
+                  e.stopPropagation(); // Blokuje przejście do detali zlecenia
+                  // TODO: Jeśli chcesz dedykowany ekran edycji, zmień ścieżkę. Na razie kierujemy do detali.
+                  router.push({
+                    pathname: "/biuro-zlecenie-detale",
+                    params: { id: item.id, trybEdycji: "tak" },
+                  });
+                }}
+              >
+                <Text style={styles.iconText}>✏️</Text>
+              </TouchableOpacity>
+            )}
+
+            {/* PRZYCISK USUŃ / ANULUJ */}
+            <TouchableOpacity
+              style={styles.iconButton}
+              onPress={(e) => {
+                e.stopPropagation();
+                handleDeleteOrCancel(item);
+              }}
+            >
+              <Text style={styles.iconText}>🗑️</Text>
+            </TouchableOpacity>
+
+            <Text style={styles.chevronIcon}>›</Text>
+          </View>
         </View>
 
         <View style={styles.zlecenieMeta}>
@@ -131,13 +277,12 @@ export default function BiuroListaZlecenScreen() {
               {formatStatusText(item.status)}
             </Text>
           </View>
-          <Text style={styles.dataText}>Wprowadzono: {dataDodania}</Text>
+          <Text style={styles.dataText}>{dataDodania}</Text>
         </View>
       </TouchableOpacity>
     );
   };
 
-  // Filtrujemy listę na żywo
   const filteredZlecenia = zlecenia.filter((zlecenie) =>
     zlecenie.numer_zd.toLowerCase().includes(searchQuery.toLowerCase()),
   );
@@ -151,7 +296,6 @@ export default function BiuroListaZlecenScreen() {
         <Text style={styles.subtitle}>Lista zleceń na produkcji (Biuro)</Text>
       </View>
 
-      {/* Pole wyszukiwarki */}
       <View style={styles.searchContainer}>
         <TextInput
           style={styles.searchInput}
@@ -191,12 +335,12 @@ export default function BiuroListaZlecenScreen() {
       <View style={styles.footer}>
         <TouchableOpacity
           style={styles.backButton}
-          // ZMIANA: Twardy powrót do głównego menu zamiast router.back()
           onPress={() => router.replace("/panel-biuro")}
         >
           <Text style={styles.buttonText}>WRÓĆ DO MENU</Text>
         </TouchableOpacity>
       </View>
+
       <CzatWidget
         idPracownika={idPracownika}
         nazwaPracownika={nazwaPracownika}
@@ -255,7 +399,21 @@ const styles = StyleSheet.create({
     flex: 1,
     marginRight: 10,
   },
+  actionIconsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  iconButton: {
+    padding: 8,
+    backgroundColor: "#f1f5f9",
+    borderRadius: 8,
+    marginRight: 10,
+  },
+  iconText: {
+    fontSize: 16,
+  },
   chevronIcon: { fontSize: 26, color: "#94a3b8", fontWeight: "bold" },
+
   zlecenieMeta: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -263,7 +421,7 @@ const styles = StyleSheet.create({
   },
   statusBadge: { paddingVertical: 5, paddingHorizontal: 12, borderRadius: 20 },
   statusText: { color: "#ffffff", fontSize: 11, fontWeight: "bold" },
-  dataText: { fontSize: 13, color: "#64748b" },
+  dataText: { fontSize: 12, color: "#64748b", fontWeight: "600" },
   emptyText: {
     textAlign: "center",
     color: "#64748b",

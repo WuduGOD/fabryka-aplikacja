@@ -2,9 +2,12 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from "react-native";
@@ -13,7 +16,7 @@ import { supabase } from "../supabase";
 
 export default function BiuroZlecenieDetaleScreen() {
   const router = useRouter();
-  const { id } = useLocalSearchParams();
+  const { id, trybEdycji } = useLocalSearchParams();
   const { idPracownika, nazwaPracownika } = useLocalSearchParams();
 
   // Flaga isMounted rozwiązująca problem React error #418 (błąd hydracji przy odświeżaniu)
@@ -24,6 +27,10 @@ export default function BiuroZlecenieDetaleScreen() {
   const [historia, setHistoria] = useState<any[]>([]);
   const [logiPracy, setLogiPracy] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // --- STANY TRYBU EDYCJI ---
+  const [isEditing, setIsEditing] = useState(trybEdycji === "tak");
+  const [edytowanePozycje, setEdytowanePozycje] = useState<any[]>([]);
 
   useEffect(() => {
     setIsMounted(true);
@@ -61,7 +68,11 @@ export default function BiuroZlecenieDetaleScreen() {
       );
 
       if (resZlecenie.data) setZlecenie(resZlecenie.data);
-      if (resPozycje.data) setPozycje(resPozycje.data);
+      if (resPozycje.data) {
+        setPozycje(resPozycje.data);
+        // Kopiujemy pozycje do stanu roboczego do edycji
+        setEdytowanePozycje(resPozycje.data);
+      }
       if (resHistoria.data) setHistoria(resHistoria.data);
       if (resLogi.data) setLogiPracy(resLogi.data);
     } catch (err) {
@@ -69,6 +80,40 @@ export default function BiuroZlecenieDetaleScreen() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleZapiszZmiany = async () => {
+    setLoading(true);
+    try {
+      // Zapisujemy w pętli każdą pozycję z zaktualizowanymi wartościami
+      for (const item of edytowanePozycje) {
+        await supabase
+          .from("pozycje_zlecenia")
+          .update({
+            ilosc: parseInt(item.ilosc, 10) || 1, // Zabezpieczenie przed pustym polem
+            instrukcje: item.instrukcje,
+          })
+          .eq("id", item.id);
+      }
+
+      if (Platform.OS === "web") {
+        window.alert("Zapisano zmiany w zleceniu!");
+      } else {
+        Alert.alert("Sukces", "Zapisano zmiany w zleceniu.");
+      }
+
+      setIsEditing(false);
+      fetchWszystkieDane();
+    } catch (error) {
+      Alert.alert("Błąd", "Wystąpił problem podczas zapisu zmian.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAnulujEdycje = () => {
+    setEdytowanePozycje([...pozycje]); // Przywracamy kopię z bazy
+    setIsEditing(false);
   };
 
   const formatDateTime = (dateStr: string) => {
@@ -89,7 +134,7 @@ export default function BiuroZlecenieDetaleScreen() {
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color="#0f172a" />
         <Text style={{ marginTop: 10, color: "#64748b" }}>
-          Wczytywanie historii...
+          Wczytywanie zlecenia...
         </Text>
       </View>
     );
@@ -103,12 +148,18 @@ export default function BiuroZlecenieDetaleScreen() {
     );
   }
 
+  // Zabezpieczenie: Jeśli produkcja już ruszyła, pozwalamy zmienić tylko tekst uwag, ale ILOŚĆ jest zablokowana!
+  const isProdukcjaStarted = ![
+    "nowe",
+    "oczekuje_kierownik",
+    "oczekuje_krojownia",
+  ].includes(zlecenie.status);
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
         <TouchableOpacity
           style={styles.backArrow}
-          // Twardy powrót do panelu, zamiast polegania na historii przeglądarki
           onPress={() => router.replace("/biuro-lista-zlecen")}
         >
           <Text style={styles.chevronIcon}>‹</Text>
@@ -117,6 +168,14 @@ export default function BiuroZlecenieDetaleScreen() {
           <Text style={styles.title}>{zlecenie.numer_zd}</Text>
           <Text style={styles.subtitle}>Podgląd Zlecenia (Biuro)</Text>
         </View>
+        {!isEditing && (
+          <TouchableOpacity
+            style={styles.editHeaderBtn}
+            onPress={() => setIsEditing(true)}
+          >
+            <Text style={styles.editHeaderBtnText}>✏️ EDYTUJ</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       <ScrollView
@@ -127,20 +186,92 @@ export default function BiuroZlecenieDetaleScreen() {
           <Text style={styles.sectionTitle}>
             📦 Lista Pozycji do Wykonania:
           </Text>
+
           {pozycje.length === 0 ? (
             <Text style={styles.emptyText}>Brak produktów w zleceniu.</Text>
           ) : (
-            pozycje.map((item) => (
+            edytowanePozycje.map((item) => (
               <View key={item.id} style={styles.pozycjaItem}>
                 <Text style={styles.pozycjaSymbol}>
                   {item.symbol || "Brak symbolu"}
                 </Text>
                 <Text style={styles.pozycjaNazwa}>
-                  {item.nazwa} -{" "}
-                  <Text style={{ fontWeight: "bold" }}>{item.ilosc} szt.</Text>
+                  {item.nazwa} {!isEditing && `- `}
+                  {!isEditing && (
+                    <Text style={{ fontWeight: "bold" }}>
+                      {item.ilosc} szt.
+                    </Text>
+                  )}
                 </Text>
+
+                {/* WIDOK EDYCJI */}
+                {isEditing ? (
+                  <View style={styles.editContainer}>
+                    <Text style={styles.inputLabel}>Ilość sztuk:</Text>
+                    <TextInput
+                      style={[
+                        styles.input,
+                        isProdukcjaStarted && styles.inputDisabled,
+                      ]}
+                      value={String(item.ilosc)}
+                      onChangeText={(text) => {
+                        if (isProdukcjaStarted) return;
+                        setEdytowanePozycje((prev) =>
+                          prev.map((p) =>
+                            p.id === item.id ? { ...p, ilosc: text } : p,
+                          ),
+                        );
+                      }}
+                      keyboardType="numeric"
+                      editable={!isProdukcjaStarted} // Blokujemy zmianę, jeśli wózek pojechał na produkcję
+                    />
+                    {isProdukcjaStarted && (
+                      <Text style={styles.warningText}>
+                        ⚠️ Produkcja już ruszyła. Nie można edytować ilości!
+                      </Text>
+                    )}
+
+                    <Text style={styles.inputLabel}>Uwagi / Instrukcje:</Text>
+                    <TextInput
+                      style={[styles.input, styles.textArea]}
+                      value={item.instrukcje}
+                      onChangeText={(text) =>
+                        setEdytowanePozycje((prev) =>
+                          prev.map((p) =>
+                            p.id === item.id ? { ...p, instrukcje: text } : p,
+                          ),
+                        )
+                      }
+                      multiline
+                      placeholder="Wpisz uwagi (np. ZMIANA NICI)..."
+                    />
+                  </View>
+                ) : /* WIDOK STANDARDOWY (Tylko odczyt) */
+                item.instrukcje ? (
+                  <Text style={styles.pozycjaInstrukcje}>
+                    ⚠️ Uwagi: {item.instrukcje}
+                  </Text>
+                ) : null}
               </View>
             ))
+          )}
+
+          {/* PRZYCISKI ZAPISU W TRYBIE EDYCJI */}
+          {isEditing && (
+            <View style={styles.editActionsRow}>
+              <TouchableOpacity
+                style={styles.cancelBtn}
+                onPress={handleAnulujEdycje}
+              >
+                <Text style={styles.cancelBtnText}>❌ ANULUJ</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.saveBtn}
+                onPress={handleZapiszZmiany}
+              >
+                <Text style={styles.saveBtnText}>💾 ZAPISZ ZMIANY</Text>
+              </TouchableOpacity>
+            </View>
           )}
         </View>
 
@@ -205,12 +336,12 @@ export default function BiuroZlecenieDetaleScreen() {
       <View style={styles.footer}>
         <TouchableOpacity
           style={styles.backButton}
-          // Twardy powrót do panelu, zamiast polegania na historii przeglądarki
           onPress={() => router.replace("/biuro-lista-zlecen")}
         >
           <Text style={styles.buttonText}>WRÓĆ DO LISTY</Text>
         </TouchableOpacity>
       </View>
+
       <CzatWidget
         idPracownika={idPracownika}
         nazwaPracownika={nazwaPracownika}
@@ -241,6 +372,16 @@ const styles = StyleSheet.create({
   title: { fontSize: 26, fontWeight: "900", color: "#0f172a", marginBottom: 2 },
   subtitle: { fontSize: 16, color: "#2563eb", fontWeight: "bold" },
 
+  editHeaderBtn: {
+    backgroundColor: "#e0f2fe",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#bae6fd",
+  },
+  editHeaderBtnText: { color: "#0369a1", fontWeight: "bold", fontSize: 12 },
+
   sectionCard: {
     backgroundColor: "#ffffff",
     borderRadius: 16,
@@ -264,7 +405,7 @@ const styles = StyleSheet.create({
   },
 
   pozycjaItem: {
-    paddingVertical: 10,
+    paddingVertical: 15,
     borderBottomWidth: 1,
     borderBottomColor: "#f1f5f9",
   },
@@ -275,7 +416,75 @@ const styles = StyleSheet.create({
     textTransform: "uppercase",
     marginBottom: 4,
   },
-  pozycjaNazwa: { fontSize: 15, color: "#334155" },
+  pozycjaNazwa: { fontSize: 18, color: "#0f172a", fontWeight: "bold" },
+  pozycjaInstrukcje: {
+    fontSize: 13,
+    color: "#ef4444",
+    marginTop: 6,
+    fontStyle: "italic",
+    fontWeight: "bold",
+  },
+
+  // TRYB EDYCJI
+  editContainer: {
+    marginTop: 15,
+    backgroundColor: "#f8fafc",
+    padding: 15,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  inputLabel: {
+    fontSize: 12,
+    fontWeight: "bold",
+    color: "#64748b",
+    marginBottom: 5,
+    marginTop: 10,
+  },
+  input: {
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#cbd5e1",
+    borderRadius: 8,
+    padding: 10,
+    fontSize: 16,
+    color: "#0f172a",
+  },
+  inputDisabled: {
+    backgroundColor: "#e2e8f0",
+    color: "#94a3b8",
+  },
+  textArea: {
+    minHeight: 60,
+    textAlignVertical: "top",
+  },
+  warningText: {
+    fontSize: 11,
+    color: "#ef4444",
+    marginTop: 5,
+    fontStyle: "italic",
+    fontWeight: "bold",
+  },
+  editActionsRow: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    marginTop: 20,
+    gap: 10,
+  },
+  cancelBtn: {
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    backgroundColor: "#f1f5f9",
+  },
+  cancelBtnText: { color: "#64748b", fontWeight: "bold" },
+  saveBtn: {
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    backgroundColor: "#10b981",
+  },
+  saveBtnText: { color: "#ffffff", fontWeight: "bold" },
 
   logContainer: {
     paddingVertical: 12,
