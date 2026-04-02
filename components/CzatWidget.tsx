@@ -1,3 +1,4 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import React, { useEffect, useRef, useState } from "react";
 import {
   FlatList,
@@ -29,23 +30,21 @@ export default function CzatWidget({
   const [isOpen, setIsOpen] = useState(false);
   const [wiadomosci, setWiadomosci] = useState<any[]>([]);
   const [nowaWiadomosc, setNowaWiadomosc] = useState("");
-  const [nieprzeczytane, setNieprzeczytane] = useState(0);
 
-  // --- STAN DLA OZNACZEŃ (@Mentions) ---
+  const [nieprzeczytane, setNieprzeczytane] = useState(0);
+  const [czyWspomniano, setCzyWspomniano] = useState(false);
+
   const [wszyscyPracownicy, setWszyscyPracownicy] = useState<string[]>([]);
   const [pokazPodpowiedzi, setPokazPodpowiedzi] = useState(false);
   const [pracownicyPodpowiedzi, setPracownicyPodpowiedzi] = useState<string[]>(
     [],
   );
 
-  // --- STAN DLA REAKCJI ---
   const [hoveredMsgId, setHoveredMsgId] = useState<string | null>(null);
   const [aktywnyMenuReakcji, setAktywnyMenuReakcji] = useState<string | null>(
     null,
   );
   const [hoveredEmoji, setHoveredEmoji] = useState<string | null>(null);
-
-  // NOWE: Stan do pokazywania/ukrywania szczegółów kto kliknął łapkę
   const [pokazKtoZareagowalId, setPokazKtoZareagowalId] = useState<
     string | null
   >(null);
@@ -61,8 +60,19 @@ export default function CzatWidget({
     : nazwaPracownika;
   const bezpiecznaRola = Array.isArray(rola) ? rola[0] : rola;
 
+  const lastSeenKey = `czat_ostatnio_widziany_${bezpiecznaNazwa}`;
+
+  // --- INTELIGENTNE SKROLLOWANIE TYLKO PRZY NOWYCH WIADOMOŚCIACH ---
   useEffect(() => {
-    pobierzWiadomosci();
+    if (isOpen && wiadomosci.length > 0) {
+      setTimeout(() => {
+        flatListRef.current?.scrollToEnd({ animated: true });
+      }, 150);
+    }
+  }, [wiadomosci.length, isOpen]);
+
+  useEffect(() => {
+    inicjalizujCzat();
     if (isOpen) pobierzPracownikowDoOznaczen();
 
     const subskrypcja = supabase
@@ -74,8 +84,15 @@ export default function CzatWidget({
           if (payload.eventType === "INSERT") {
             const nowa = payload.new;
             setWiadomosci((prev) => [...prev, nowa]);
+
             if (!isOpen && nowa.id_pracownika !== bezpieczneId) {
               setNieprzeczytane((prev) => prev + 1);
+              if (
+                nowa.wiadomosc.includes(`@${bezpiecznaNazwa}`) ||
+                nowa.wiadomosc.includes("@Wszyscy")
+              ) {
+                setCzyWspomniano(true);
+              }
             }
           } else if (payload.eventType === "UPDATE") {
             setWiadomosci((prev) =>
@@ -91,13 +108,55 @@ export default function CzatWidget({
     };
   }, [isOpen]);
 
-  const pobierzWiadomosci = async () => {
+  const inicjalizujCzat = async () => {
     const { data } = await supabase
       .from("czat_kadra")
       .select("*")
-      .order("utworzono", { ascending: true })
+      .order("utworzono", { ascending: false })
       .limit(50);
-    if (data) setWiadomosci(data);
+
+    if (data) {
+      const posortowane = data.reverse();
+      setWiadomosci(posortowane);
+
+      if (!isOpen) {
+        try {
+          const lastSeenStr = await AsyncStorage.getItem(lastSeenKey);
+          if (lastSeenStr) {
+            const lastSeenTime = new Date(lastSeenStr).getTime();
+
+            const noweWiadomosci = posortowane.filter(
+              (w) =>
+                new Date(w.utworzono).getTime() > lastSeenTime &&
+                w.id_pracownika !== bezpieczneId,
+            );
+
+            setNieprzeczytane(noweWiadomosci.length);
+
+            const wspomniano = noweWiadomosci.some(
+              (w) =>
+                w.wiadomosc.includes(`@${bezpiecznaNazwa}`) ||
+                w.wiadomosc.includes("@Wszyscy"),
+            );
+            setCzyWspomniano(wspomniano);
+          } else {
+            const obce = posortowane.filter(
+              (w) => w.id_pracownika !== bezpieczneId,
+            );
+            setNieprzeczytane(obce.length);
+            setCzyWspomniano(
+              obce.some(
+                (w) =>
+                  w.wiadomosc.includes(`@${bezpiecznaNazwa}`) ||
+                  w.wiadomosc.includes("@Wszyscy"),
+              ),
+            );
+          }
+        } catch (e) {
+          console.error("Błąd odczytu lastSeen z AsyncStorage", e);
+        }
+      }
+    }
   };
 
   const pobierzPracownikowDoOznaczen = async () => {
@@ -144,6 +203,8 @@ export default function CzatWidget({
         wiadomosc: tekst,
       },
     ]);
+
+    await AsyncStorage.setItem(lastSeenKey, new Date().toISOString());
   };
 
   const toggleReakcja = async (
@@ -187,9 +248,24 @@ export default function CzatWidget({
       .eq("id", wiadomoscId);
   };
 
-  const otworzCzat = () => {
+  const otworzCzat = async () => {
     setIsOpen(true);
     setNieprzeczytane(0);
+    setCzyWspomniano(false);
+    try {
+      await AsyncStorage.setItem(lastSeenKey, new Date().toISOString());
+    } catch (e) {
+      console.error("Błąd zapisu lastSeen do AsyncStorage", e);
+    }
+  };
+
+  const zamknijCzat = async () => {
+    setIsOpen(false);
+    try {
+      await AsyncStorage.setItem(lastSeenKey, new Date().toISOString());
+    } catch (e) {
+      console.error("Błąd zapisu lastSeen do AsyncStorage", e);
+    }
   };
 
   const handleTextChange = (text: string) => {
@@ -339,7 +415,6 @@ export default function CzatWidget({
             </Text>
           </Pressable>
 
-          {/* NOWY BLOK Z INFORMACJAMI POD DYMKIEM */}
           <View
             style={[
               styles.podpisInformacyjny,
@@ -350,7 +425,6 @@ export default function CzatWidget({
 
             {iloscReakcji && (
               <>
-                {/* 1. Licznik klikalny (pokazuje tylko sumę łapek) */}
                 <TouchableOpacity
                   style={styles.reakcjePodsumowanieBtn}
                   onPress={() =>
@@ -366,7 +440,6 @@ export default function CzatWidget({
                   ))}
                 </TouchableOpacity>
 
-                {/* 2. Rozwinięte szczegóły (kto dokładnie dał łapkę) */}
                 {pokazKtoZareagowalId === item.id && (
                   <View style={styles.reakcjeSzczegolyBox}>
                     {wpisyReakcji.map(([emoji, users]: any) => (
@@ -405,8 +478,13 @@ export default function CzatWidget({
         <TouchableOpacity style={styles.fab} onPress={otworzCzat}>
           <Text style={styles.fabIcon}>💬</Text>
           {nieprzeczytane > 0 && (
-            <View style={styles.badge}>
-              <Text style={styles.badgeText}>{nieprzeczytane}</Text>
+            <View
+              style={[styles.badge, czyWspomniano && styles.badgeWspomniano]}
+            >
+              <Text style={styles.badgeText}>
+                {czyWspomniano ? "🔔 " : ""}
+                {nieprzeczytane}
+              </Text>
             </View>
           )}
         </TouchableOpacity>
@@ -419,10 +497,7 @@ export default function CzatWidget({
         >
           <View style={styles.czatHeader}>
             <Text style={styles.czatTitle}>💬 Czat Firmowy</Text>
-            <TouchableOpacity
-              onPress={() => setIsOpen(false)}
-              style={styles.closeBtn}
-            >
+            <TouchableOpacity onPress={zamknijCzat} style={styles.closeBtn}>
               <Text style={styles.closeBtnText}>✖</Text>
             </TouchableOpacity>
           </View>
@@ -432,21 +507,16 @@ export default function CzatWidget({
             activeOpacity={1}
             onPress={() => {
               setAktywnyMenuReakcji(null);
-              setPokazKtoZareagowalId(null); // Zamknięcie szczegółów po kliknięciu w tło
+              setPokazKtoZareagowalId(null);
             }}
           >
+            {/* ZMIANA: Usunięto onContentSizeChange i onLayout z FlatList */}
             <FlatList
               ref={flatListRef}
               data={wiadomosci}
               keyExtractor={(item) => item.id}
               renderItem={renderWiadomosc}
               contentContainerStyle={styles.listaWiadomosci}
-              onContentSizeChange={() =>
-                flatListRef.current?.scrollToEnd({ animated: true })
-              }
-              onLayout={() =>
-                flatListRef.current?.scrollToEnd({ animated: true })
-              }
             />
           </TouchableOpacity>
 
@@ -482,6 +552,11 @@ export default function CzatWidget({
               onFocus={() => {
                 setAktywnyMenuReakcji(null);
                 setPokazKtoZareagowalId(null);
+                // Dajemy mały skok w dół po otwarciu klawiatury
+                setTimeout(
+                  () => flatListRef.current?.scrollToEnd({ animated: true }),
+                  100,
+                );
               }}
             />
             <TouchableOpacity style={styles.sendBtn} onPress={wyslijWiadomosc}>
@@ -518,12 +593,17 @@ const styles = StyleSheet.create({
     top: -5,
     right: -5,
     backgroundColor: "#ef4444",
-    width: 24,
+    minWidth: 24,
     height: 24,
     borderRadius: 12,
     justifyContent: "center",
     alignItems: "center",
     borderWidth: 2,
+    borderColor: "#fff",
+    paddingHorizontal: 5,
+  },
+  badgeWspomniano: {
+    backgroundColor: "#f59e0b",
     borderColor: "#fff",
   },
   badgeText: { color: "#fff", fontSize: 12, fontWeight: "bold" },
@@ -650,7 +730,6 @@ const styles = StyleSheet.create({
   },
   reactionMenuEmoji: { fontSize: 22 },
 
-  // --- ZMIANA: NOWE STYLE DLA PODPISU I REAKCJI ---
   podpisInformacyjny: {
     marginTop: 4,
     paddingHorizontal: 4,

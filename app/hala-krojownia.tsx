@@ -10,7 +10,7 @@ import {
   Modal,
   Platform,
   RefreshControl,
-  SafeAreaView, // <-- Dodano do bezpiecznego paska!
+  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
@@ -35,10 +35,15 @@ export default function KrojowniaScreen() {
   const [zleceniaDoKontroli, setZleceniaDoKontroli] = useState<any[]>([]);
 
   const [pozycje, setPozycje] = useState<any[]>([]);
+  const [receptury, setReceptury] = useState<any[]>([]);
+  const [zrobioneKafelki, setZrobioneKafelki] = useState<string[]>([]);
+
+  // Stan podsumowania
+  const [isPodsumowanieVisible, setIsPodsumowanieVisible] = useState(false);
+
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // --- STANY OFFLINE ---
   const [isOnline, setIsOnline] = useState(true);
   const [zalegleSkany, setZalegleSkany] = useState(0);
 
@@ -78,9 +83,33 @@ export default function KrojowniaScreen() {
             .select("*")
             .in("id_zlecenia", zleceniaIds);
 
-          if (pozycjeData) setPozycje(pozycjeData);
+          if (pozycjeData) {
+            setPozycje(pozycjeData);
+
+            const symbole = [
+              ...new Set(pozycjeData.map((p) => p.symbol).filter(Boolean)),
+            ];
+
+            if (symbole.length > 0) {
+              const { data: recepturyData } = await supabase
+                .from("receptury")
+                .select(
+                  `
+                  symbol_produktu,
+                  ilosc,
+                  magazyn_komponentow ( id, nazwa, symbol )
+                `,
+                )
+                .in("symbol_produktu", symbole);
+
+              if (recepturyData) {
+                setReceptury(recepturyData);
+              }
+            }
+          }
         } else {
           setPozycje([]);
+          setReceptury([]);
         }
       }
     } catch (err) {
@@ -104,7 +133,7 @@ export default function KrojowniaScreen() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "zlecenia" },
-        (payload) => {
+        () => {
           fetchZlecenia(true);
         },
       )
@@ -115,6 +144,93 @@ export default function KrojowniaScreen() {
       supabase.removeChannel(subskrypcja);
     };
   }, []);
+
+  // --- FUNKCJA DO FILTROWANIA UWAG ---
+  const filtrujUwagi = (text: string | null) => {
+    if (!text) return "";
+    const markers = ["produkcja", " pr ", " pr:", " pr.", "-pr", " pr-", "pr,"];
+    let cleanedText = text;
+    const lowerText = text.toLowerCase();
+
+    for (const marker of markers) {
+      const index = lowerText.indexOf(marker);
+      if (index !== -1) {
+        cleanedText = text.substring(0, index);
+        break;
+      }
+    }
+    return cleanedText.trim();
+  };
+
+  // --- LOGIKA ZBIORCZEGO ZESTAWIENIA (TUTAJ SĄ POKROWCE) ---
+  const generujPodsumowanie = () => {
+    const podsumowanie = new Map();
+    const aktywneZlecenia = [...zleceniaNowe, ...zleceniaWTrakcie];
+
+    aktywneZlecenia.forEach((zlecenie) => {
+      const produktyZlecenia = pozycje.filter(
+        (p) => p.id_zlecenia === zlecenie.id,
+      );
+
+      produktyZlecenia.forEach((prod) => {
+        if (prod.czy_z_regalu) return;
+
+        const przepisy = receptury.filter(
+          (r) => r.symbol_produktu === prod.symbol,
+        );
+
+        const czysteUwagi = filtrujUwagi(prod.instrukcje);
+
+        if (przepisy.length === 0) {
+          const nazwa = prod.nazwa;
+          const ilosc = prod.ilosc || 1;
+
+          if (!podsumowanie.has(nazwa)) {
+            podsumowanie.set(nazwa, { nazwa, total: 0, detale: [] });
+          }
+
+          const wpis = podsumowanie.get(nazwa);
+          wpis.total += ilosc;
+          wpis.detale.push({
+            zd: zlecenie.numer_zd,
+            szt: ilosc,
+            zCzego: null,
+            uwagi: czysteUwagi,
+          });
+        } else {
+          przepisy.forEach((przepis) => {
+            const nazwa =
+              przepis.magazyn_komponentow?.nazwa ||
+              `Pokrowiec do ${prod.symbol}`;
+            const iloscCalkowita = (prod.ilosc || 1) * (przepis.ilosc || 1);
+
+            if (!podsumowanie.has(nazwa)) {
+              podsumowanie.set(nazwa, { nazwa, total: 0, detale: [] });
+            }
+
+            const wpis = podsumowanie.get(nazwa);
+            wpis.total += iloscCalkowita;
+            wpis.detale.push({
+              zd: zlecenie.numer_zd,
+              szt: iloscCalkowita,
+              zCzego: prod.nazwa,
+              uwagi: czysteUwagi,
+            });
+          });
+        }
+      });
+    });
+
+    return Array.from(podsumowanie.values());
+  };
+
+  const toggleKafelekZrobiony = (kafelekId: string) => {
+    setZrobioneKafelki((prev) =>
+      prev.includes(kafelekId)
+        ? prev.filter((id) => id !== kafelekId)
+        : [...prev, kafelekId],
+    );
+  };
 
   const handleZatwierdzQC = async () => {
     if (!qcZlecenie) return;
@@ -357,14 +473,11 @@ export default function KrojowniaScreen() {
         const czasZakonczenia = new Date().toISOString();
 
         if (isOnline) {
-          // --- NOWA, KULO-ODPORNA LOGIKA ZAMYKANIA LOGU ---
-          // Aktualizujemy bezpośrednio wszystkie otwarte logi krojenia dla tego zlecenia,
-          // dzięki temu odpada problem błędu .maybeSingle() gdy np. były dwa!
           await supabase
             .from("logi_pracy")
             .update({ czas_stop: czasZakonczenia })
             .match({ id_zlecenia: zlecenie.id, etap_pracy: "krojenie" })
-            .is("czas_stop", null); // Tylko te, które faktycznie trwają
+            .is("czas_stop", null);
 
           await supabase
             .from("zlecenia")
@@ -385,7 +498,6 @@ export default function KrojowniaScreen() {
             `Materiał z ${numerZD} gotowy dla Szwalni.`,
           );
         } else {
-          // W trybie offline też wymuszamy zaktualizowanie na podstawie pasujących kluczy (match)
           await SyncManager.dodajDoKolejki(
             "logi_pracy",
             "UPDATE",
@@ -445,6 +557,7 @@ export default function KrojowniaScreen() {
     setIsCameraOpen(true);
   };
 
+  // --- KARTA ZAMÓWIENIA W GŁÓWNYM MENU (WYŚWIETLA MATERACE) ---
   const renderZlecenieKarta = (
     z: any,
     borderColor: string,
@@ -471,67 +584,93 @@ export default function KrojowniaScreen() {
 
         {isExpanded && (
           <View style={styles.expandedContent}>
-            <Text style={styles.expandedTitle}>
-              Decyzja Kierownika (co uciąć, a co z regału):
-            </Text>
+            <Text style={styles.expandedTitle}>Zadania z tego wózka:</Text>
             {produktyZlecenia.length === 0 ? (
               <Text style={styles.emptyText}>Brak dodanych produktów.</Text>
             ) : (
               produktyZlecenia.map((prod) => {
                 const doSzycia = !prod.czy_z_regalu;
+                const czysteUwagi = filtrujUwagi(prod.instrukcje);
+
+                if (!doSzycia) {
+                  return (
+                    <View
+                      key={prod.id}
+                      style={[
+                        styles.pozycjaRow,
+                        {
+                          backgroundColor: "#f8fafc",
+                          borderColor: "#e2e8f0",
+                          opacity: 0.8,
+                        },
+                      ]}
+                    >
+                      <View style={[styles.checkbox, styles.checkboxInactive]}>
+                        <Text style={styles.checkboxText}>📦</Text>
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text
+                          style={[
+                            styles.pozycjaNazwa,
+                            styles.pozycjaPrzekreslona,
+                          ]}
+                        >
+                          {prod.nazwa}{" "}
+                          <Text style={{ color: "#94a3b8" }}>
+                            (x{prod.ilosc})
+                          </Text>
+                        </Text>
+                        <Text style={styles.pozycjaInfoMagazyn}>
+                          Kierownik wziął gotowe z regału.
+                        </Text>
+                      </View>
+                    </View>
+                  );
+                }
+
+                // TUTAJ NIE ROZBIJAMY JUŻ NA RECEPTURY - POKAZUJEMY MATERAC
+                const kafelekId = `${z.id}_${prod.id}`;
+                const isDone = zrobioneKafelki.includes(kafelekId);
+
                 return (
-                  <View
-                    key={prod.id}
+                  <TouchableOpacity
+                    key={kafelekId}
+                    activeOpacity={0.7}
+                    onPress={() => toggleKafelekZrobiony(kafelekId)}
                     style={[
                       styles.pozycjaRow,
-                      !doSzycia && {
-                        backgroundColor: "#f8fafc",
-                        borderColor: "#e2e8f0",
-                        opacity: 0.8,
-                      },
+                      isDone && styles.pozycjaZrobionaBg,
                     ]}
                   >
                     <View
                       style={[
                         styles.checkbox,
-                        doSzycia
-                          ? styles.checkboxActive
-                          : styles.checkboxInactive,
+                        isDone ? styles.checkboxActive : styles.checkboxToCut,
                       ]}
                     >
                       <Text style={styles.checkboxText}>
-                        {doSzycia ? "✂️" : "📦"}
+                        {isDone ? "✅" : "✂️"}
                       </Text>
                     </View>
                     <View style={{ flex: 1 }}>
                       <Text
                         style={[
                           styles.pozycjaNazwa,
-                          !doSzycia && styles.pozycjaPrzekreslona,
+                          isDone && styles.pozycjaPrzekreslona,
                         ]}
                       >
                         {prod.nazwa}{" "}
-                        <Text
-                          style={[
-                            styles.pozycjaIlosc,
-                            !doSzycia && { color: "#94a3b8" },
-                          ]}
-                        >
-                          (x{prod.ilosc})
+                        <Text style={styles.pozycjaIlosc}>
+                          (x{prod.ilosc || 1})
                         </Text>
                       </Text>
-                      {prod.instrukcje && doSzycia ? (
+                      {czysteUwagi ? (
                         <Text style={styles.pozycjaInstrukcja}>
-                          Uwagi: {prod.instrukcje}
+                          Uwagi: {czysteUwagi}
                         </Text>
                       ) : null}
-                      {!doSzycia && (
-                        <Text style={styles.pozycjaInfoMagazyn}>
-                          Kierownik wziął z regału. POMIŃ TĘ POZYCJĘ.
-                        </Text>
-                      )}
                     </View>
-                  </View>
+                  </TouchableOpacity>
                 );
               })
             )}
@@ -574,7 +713,6 @@ export default function KrojowniaScreen() {
   if (isCameraOpen) {
     return (
       <SafeAreaView style={{ flex: 1, backgroundColor: "#000" }}>
-        {/* Pasek Offline w aparacie z SafeAreaView chroni przed wejściem na zegarek */}
         {!isOnline && (
           <View
             style={{
@@ -614,10 +752,10 @@ export default function KrojowniaScreen() {
     );
   }
 
-  // --- ZMIANA: Główny kontener to SafeAreaView (bezpieczna strefa) zamiast KeyboardAvoidingView
+  const danePodsumowania = generujPodsumowanie();
+
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: "#f8fafc" }}>
-      {/* Pasek Offline - teraz przyczepiony w bezpiecznej strefie */}
       {!isOnline && (
         <View
           style={{
@@ -639,9 +777,80 @@ export default function KrojowniaScreen() {
         </View>
       )}
 
-      {/* Układ pod klawiaturę jest teraz wewnątrz SafeAreaView */}
+      {/* MODAL ZBIORCZEGO PODSUMOWANIA (TUTAJ SĄ POKROWCE I UWAGI DLA SZWALNI) */}
+      <Modal
+        visible={isPodsumowanieVisible}
+        transparent={true}
+        animationType="fade"
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.aggrModalContent}>
+            <Text style={styles.qcModalTitle}>📊 Zbiorcza Lista Cięcia</Text>
+            <Text style={styles.qcModalSubtitle}>
+              Pogrupowane pokrowce/komponenty dla Twoich zamówień:
+            </Text>
+
+            <ScrollView
+              style={{ maxHeight: 400, marginTop: 10 }}
+              showsVerticalScrollIndicator={true}
+            >
+              {danePodsumowania.length === 0 ? (
+                <Text style={styles.emptyText}>
+                  Brak otwartych zadań cięcia.
+                </Text>
+              ) : (
+                danePodsumowania.map((item, idx) => (
+                  <View key={idx} style={styles.aggrRow}>
+                    <View style={{ flex: 1, paddingRight: 10 }}>
+                      <Text style={styles.aggrTitle}>✂️ {item.nazwa}</Text>
+
+                      {item.detale.map((detal: any, dIdx: number) => (
+                        <View
+                          key={dIdx}
+                          style={{ marginTop: 6, paddingLeft: 5 }}
+                        >
+                          <Text style={styles.aggrDetails}>
+                            • Wózek:{" "}
+                            <Text
+                              style={{ fontWeight: "bold", color: "#334155" }}
+                            >
+                              {detal.zd}
+                            </Text>{" "}
+                            (x{detal.szt})
+                            {detal.zCzego ? ` z modelu: ${detal.zCzego}` : ""}
+                          </Text>
+
+                          {detal.uwagi ? (
+                            <Text style={styles.aggrUwagi}>
+                              ⚠️ Uwagi: {detal.uwagi}
+                            </Text>
+                          ) : null}
+                        </View>
+                      ))}
+                    </View>
+
+                    <View style={styles.aggrTotalBadge}>
+                      <Text style={styles.aggrTotalText}>
+                        {item.total} szt.
+                      </Text>
+                    </View>
+                  </View>
+                ))
+              )}
+            </ScrollView>
+
+            <TouchableOpacity
+              style={styles.aggrCloseBtn}
+              onPress={() => setIsPodsumowanieVisible(false)}
+            >
+              <Text style={styles.buttonText}>ZAMKNIJ PODSUMOWANIE</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
       <KeyboardAvoidingView
-        style={[styles.container, { paddingTop: isOnline ? 20 : 10 }]} // Zmniejszony margines jeśli jest pasek
+        style={[styles.container, { paddingTop: isOnline ? 20 : 10 }]}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
       >
         <Modal visible={!!qcZlecenie} transparent={true} animationType="slide">
@@ -776,14 +985,24 @@ export default function KrojowniaScreen() {
         <View style={styles.header}>
           <Text style={styles.title}>Panel Krojowni</Text>
           <Text style={styles.subtitle}>Zalogowano: {nazwaPracownika}</Text>
-          <TouchableOpacity
-            style={styles.managerButton}
-            onPress={() => router.push("/hala-kierownik-szwalni")}
-          >
-            <Text style={styles.managerButtonText}>
-              📊 PODGLĄD SZWALNI (KIEROWNIK)
-            </Text>
-          </TouchableOpacity>
+
+          <View style={{ flexDirection: "row", gap: 10, marginTop: 15 }}>
+            <TouchableOpacity
+              style={styles.managerButton}
+              onPress={() => router.push("/hala-kierownik-szwalni")}
+            >
+              <Text style={styles.managerButtonText}>📊 PANEL KIEROWNIKA</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.summaryButton}
+              onPress={() => setIsPodsumowanieVisible(true)}
+            >
+              <Text style={styles.managerButtonText}>
+                📦 ZBIORCZA LISTA CIĘCIA
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         <View style={styles.listWrapper}>
@@ -1022,27 +1241,38 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#e2e8f0",
   },
+  pozycjaZrobionaBg: {
+    backgroundColor: "#f1f5f9",
+    opacity: 0.6,
+  },
   checkbox: {
-    width: 26,
-    height: 26,
-    borderRadius: 6,
+    width: 32,
+    height: 32,
+    borderRadius: 8,
     borderWidth: 2,
     alignItems: "center",
     justifyContent: "center",
     marginRight: 15,
   },
+  checkboxToCut: { backgroundColor: "#f59e0b", borderColor: "#f59e0b" },
   checkboxActive: { backgroundColor: "#10b981", borderColor: "#10b981" },
-  checkboxInactive: { backgroundColor: "#f1f5f9", borderColor: "#cbd5e1" },
+  checkboxInactive: { backgroundColor: "#e2e8f0", borderColor: "#cbd5e1" },
   checkboxText: { color: "#fff", fontWeight: "bold", fontSize: 14 },
 
   pozycjaNazwa: { fontSize: 14, color: "#0f172a", fontWeight: "bold" },
   pozycjaPrzekreslona: { color: "#94a3b8", textDecorationLine: "line-through" },
-  pozycjaIlosc: { color: "#f59e0b" },
+  pozycjaIlosc: { color: "#0ea5e9", fontWeight: "900" },
   pozycjaInstrukcja: {
     fontSize: 12,
-    color: "#64748b",
+    color: "#ef4444",
     marginTop: 4,
     fontStyle: "italic",
+    fontWeight: "bold",
+  },
+  pozycjaInstrukcjaMalutka: {
+    fontSize: 10,
+    color: "#94a3b8",
+    marginTop: 2,
   },
   pozycjaInfoMagazyn: {
     fontSize: 11,
@@ -1121,6 +1351,76 @@ const styles = StyleSheet.create({
   },
   qcModalBtn: { paddingVertical: 15, borderRadius: 10 },
 
+  // --- STYLE PODSUMOWANIA ZBIORCZEGO ---
+  aggrModalContent: {
+    width: "100%",
+    maxWidth: 600,
+    backgroundColor: "#fff",
+    borderRadius: 20,
+    padding: 25,
+    elevation: 10,
+    maxHeight: "85%",
+  },
+  aggrRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: "#f8fafc",
+    padding: 15,
+    borderRadius: 12,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  aggrTitle: { fontSize: 16, fontWeight: "bold", color: "#0f172a" },
+  aggrDetails: {
+    fontSize: 12,
+    color: "#64748b",
+    marginTop: 2,
+    fontWeight: "500",
+  },
+  aggrUwagi: {
+    fontSize: 12,
+    color: "#ef4444",
+    fontStyle: "italic",
+    fontWeight: "bold",
+    marginTop: 2,
+  },
+  aggrTotalBadge: {
+    backgroundColor: "#f59e0b",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    alignSelf: "flex-start",
+    marginTop: 5,
+  },
+  aggrTotalText: { color: "#fff", fontWeight: "900", fontSize: 16 },
+  aggrCloseBtn: {
+    backgroundColor: "#0f172a",
+    padding: 15,
+    borderRadius: 12,
+    alignItems: "center",
+    marginTop: 15,
+  },
+
+  managerButton: {
+    backgroundColor: "#8b5cf6",
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    shadowOpacity: 0.1,
+    elevation: 3,
+  },
+  summaryButton: {
+    backgroundColor: "#10b981",
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    shadowOpacity: 0.1,
+    elevation: 3,
+  },
+  managerButtonText: { color: "#ffffff", fontSize: 13, fontWeight: "bold" },
+
   footerContainer: {
     padding: 20,
     backgroundColor: "#f8fafc",
@@ -1162,14 +1462,4 @@ const styles = StyleSheet.create({
     borderRadius: 15,
     alignItems: "center",
   },
-  managerButton: {
-    backgroundColor: "#8b5cf6",
-    paddingVertical: 10,
-    paddingHorizontal: 20,
-    borderRadius: 10,
-    marginTop: 15,
-    shadowOpacity: 0.1,
-    elevation: 3,
-  },
-  managerButtonText: { color: "#ffffff", fontSize: 13, fontWeight: "bold" },
 });
